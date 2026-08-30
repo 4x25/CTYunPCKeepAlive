@@ -1,0 +1,1 @@
+window.commonConfig = { isIntl: false,supportGray: true }
