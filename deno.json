@@ -20,6 +20,8 @@
   "tasks": {
     "probe": "deno run --env-file --allow-env --allow-net --allow-read src/cli/probe.ts",
     "keepalive": "deno run --env-file --allow-env --allow-net --allow-read src/cli/keepalive.ts",
+    "daemon": "deno run --env-file --allow-env --allow-net --allow-read --allow-write src/cli/daemon.ts",
+    "list-devices": "deno run --env-file --allow-env --allow-net --allow-read src/cli/list-devices.ts",
     "test": "deno test --allow-env --allow-read",
     "check": "deno check src/ && deno lint && deno fmt --check"
   },

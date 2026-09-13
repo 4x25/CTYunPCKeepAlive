@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "accounts": [
+    {
+      "account": "13800000000",
+      "password": "test123",
+      "alias": "测试账号",
+      "devices": [],
+      "autoSaveIntervalMs": 300000
+    }
+  ]
+}

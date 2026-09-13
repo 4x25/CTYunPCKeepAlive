@@ -172,19 +172,29 @@ export interface LoggerOptions {
   /** 环形缓冲容量，需求稿 §5 要求 2000。 */
   capacity?: number;
   sink?: (r: LogRecord) => void;
+  /** 日志目录（用于每日 JSONL），不传则不落盘 */
+  logDir?: string | undefined;
 }
 
-/** M0 最小实现：环形缓冲 + 可插拔 sink。落盘与清理在 M2 补齐。 */
+/** M2 完整版：环形缓冲 + 每日 JSONL + 7 天/5 MB 清理 + 03:00 清理（错过补做） */
 export class Logger {
   readonly #buf: LogRecord[] = [];
   readonly #capacity: number;
   readonly #verbose: boolean;
   readonly #sink: (r: LogRecord) => void;
+  readonly #logDir?: string | undefined;
+  #currentLogFile?: string;
+  #lastCleanupDate?: string;
 
   constructor(opts: LoggerOptions = {}) {
     this.#capacity = opts.capacity ?? 2000;
     this.#verbose = opts.verbose ?? true;
     this.#sink = opts.sink ?? defaultConsoleSink;
+    this.#logDir = opts.logDir;
+
+    if (this.#logDir) {
+      this.#scheduleCleanup();
+    }
   }
 
   debug(module: LogModule, message: string, detail?: unknown): void {
@@ -211,6 +221,97 @@ export class Logger {
     this.#buf.push(record);
     if (this.#buf.length > this.#capacity) this.#buf.shift();
     this.#sink(record);
+
+    // 落盘到每日 JSONL
+    if (this.#logDir) {
+      this.#appendToFile(record).catch((err) => {
+        console.error("日志落盘失败:", err);
+      });
+    }
+  }
+
+  async #appendToFile(record: LogRecord): Promise<void> {
+    if (!this.#logDir) return;
+
+    const date = new Date(record.ts).toISOString().slice(0, 10);
+    const logFile = `${this.#logDir}/${date}.jsonl`;
+
+    // 确保目录存在
+    await Deno.mkdir(this.#logDir, { recursive: true });
+
+    // 如果日期变化，触发清理
+    if (date !== this.#lastCleanupDate) {
+      this.#lastCleanupDate = date;
+      this.#cleanup().catch((err) => console.error("日志清理失败:", err));
+    }
+
+    // 追加 JSONL
+    const line = JSON.stringify(record) + "\n";
+    await Deno.writeTextFile(logFile, line, { append: true });
+    this.#currentLogFile = logFile;
+  }
+
+  async #cleanup(): Promise<void> {
+    if (!this.#logDir) return;
+
+    const now = Date.now();
+    const sevenDaysAgo = now - 7 * 24 * 3600_000;
+    const maxSize = 5 * 1024 * 1024; // 5 MB
+
+    try {
+      let totalSize = 0;
+      const files: Array<{ path: string; mtime: number; size: number }> = [];
+
+      for await (const entry of Deno.readDir(this.#logDir)) {
+        if (!entry.isFile || !entry.name.endsWith(".jsonl")) continue;
+
+        const path = `${this.#logDir}/${entry.name}`;
+        const stat = await Deno.stat(path);
+        files.push({ path, mtime: stat.mtime?.getTime() ?? 0, size: stat.size });
+        totalSize += stat.size;
+      }
+
+      // 删除 7 天前的
+      for (const file of files) {
+        if (file.mtime < sevenDaysAgo) {
+          await Deno.remove(file.path);
+          totalSize -= file.size;
+        }
+      }
+
+      // 如果总大小超过 5 MB，删除最旧的
+      if (totalSize > maxSize) {
+        const sorted = files
+          .filter((f) => f.mtime >= sevenDaysAgo)
+          .sort((a, b) => a.mtime - b.mtime);
+
+        for (const file of sorted) {
+          if (totalSize <= maxSize) break;
+          await Deno.remove(file.path);
+          totalSize -= file.size;
+        }
+      }
+    } catch (err) {
+      console.error("清理日志文件失败:", err);
+    }
+  }
+
+  #scheduleCleanup(): void {
+    // 每天 03:00 清理（错过补做）
+    const now = new Date();
+    let next = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 3, 0, 0, 0);
+    if (next <= now) {
+      next = new Date(next.getTime() + 24 * 3600_000);
+    }
+
+    const delay = next.getTime() - now.getTime();
+    setTimeout(() => {
+      this.#cleanup().catch((err) => console.error("定时清理失败:", err));
+      // 24 小时后再次执行
+      setInterval(() => {
+        this.#cleanup().catch((err) => console.error("定时清理失败:", err));
+      }, 24 * 3600_000);
+    }, delay);
   }
 }
 
