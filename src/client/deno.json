@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "jsxImportSource": "jsr:@hono/hono/jsx/dom",
+    "lib": ["deno.window", "dom", "dom.iterable", "esnext"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true
+  },
+  "imports": {
+    "@hono/hono/jsx/dom": "jsr:@hono/hono@^4.13.7/jsx/dom",
+    "@hono/hono/jsx": "jsr:@hono/hono@^4.13.7/jsx"
+  }
+}

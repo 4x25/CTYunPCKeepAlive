@@ -11,7 +11,7 @@ import { createBrowserFetch } from "../core/ctyun/http.ts";
 import { establishSession } from "../core/ctyun/nego.ts";
 import { login } from "../core/ctyun/auth.ts";
 import { listDesktops } from "../core/ctyun/desktops.ts";
-import { keepalive } from "../core/keepalive.ts";
+import { keepalive } from "../core/keepalive-core.ts";
 import { Logger, maskAccount } from "../core/logger.ts";
 
 const log = new Logger({ verbose: true });

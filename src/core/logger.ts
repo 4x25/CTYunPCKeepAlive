@@ -18,6 +18,9 @@ export interface LogRecord {
   detail?: unknown;
 }
 
+/** 别名：UI/SSE 层用 LogEntry 这个名字。 */
+export type LogEntry = LogRecord;
+
 /**
  * 永不输出原值的字段名（小写比较）。命中即替换为 `<redacted>`。
  *
@@ -174,6 +177,8 @@ export interface LoggerOptions {
   sink?: (r: LogRecord) => void;
   /** 日志目录（用于每日 JSONL），不传则不落盘 */
   logDir?: string | undefined;
+  /** 每条日志产出后的回调（SSE 推送用）。不传则只走 sink。 */
+  onRecord?: ((r: LogRecord) => void) | undefined;
 }
 
 /** M2 完整版：环形缓冲 + 每日 JSONL + 7 天/5 MB 清理 + 03:00 清理（错过补做） */
@@ -183,6 +188,7 @@ export class Logger {
   readonly #verbose: boolean;
   readonly #sink: (r: LogRecord) => void;
   readonly #logDir?: string | undefined;
+  readonly #onRecord?: ((r: LogRecord) => void) | undefined;
   #currentLogFile?: string;
   #lastCleanupDate?: string;
 
@@ -191,6 +197,7 @@ export class Logger {
     this.#verbose = opts.verbose ?? true;
     this.#sink = opts.sink ?? defaultConsoleSink;
     this.#logDir = opts.logDir;
+    this.#onRecord = opts.onRecord;
 
     if (this.#logDir) {
       this.#scheduleCleanup();
@@ -221,6 +228,7 @@ export class Logger {
     this.#buf.push(record);
     if (this.#buf.length > this.#capacity) this.#buf.shift();
     this.#sink(record);
+    this.#onRecord?.(record);
 
     // 落盘到每日 JSONL
     if (this.#logDir) {

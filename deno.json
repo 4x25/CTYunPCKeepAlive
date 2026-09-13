@@ -22,6 +22,12 @@
     "keepalive": "deno run --env-file --allow-env --allow-net --allow-read src/cli/keepalive.ts",
     "daemon": "deno run --env-file --allow-env --allow-net --allow-read --allow-write src/cli/daemon.ts",
     "list-devices": "deno run --env-file --allow-env --allow-net --allow-read src/cli/list-devices.ts",
+    "css": "npx tailwindcss -i src/client/styles.css -o assets/styles.css --minify",
+    "css:watch": "npx tailwindcss -i src/client/styles.css -o assets/styles.css --watch",
+    "client": "deno run --allow-read --allow-write --allow-env --allow-net --allow-run scripts/bundle-client.ts",
+    "verify:client": "deno run -A --no-lock scripts/verify-client.ts",
+    "server": "deno run --env-file --allow-env --allow-net --allow-read --allow-write src/server/main.ts",
+    "dev": "deno task css && deno task client && deno task server",
     "test": "deno test --allow-env --allow-read",
     "check": "deno check src/ && deno lint && deno fmt --check"
   },
@@ -38,5 +44,11 @@
     "semiColons": true,
     "singleQuote": false
   },
-  "exclude": ["dist/", "assets/app.css", "assets/client.js", "docs/bundle-snapshots/"]
+  "exclude": [
+    "dist/",
+    "assets/app.css",
+    "assets/client.js",
+    "docs/bundle-snapshots/",
+    "src/client/"
+  ]
 }

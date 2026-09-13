@@ -7,12 +7,16 @@
  * 按 Ctrl+C 优雅退出（自动保存状态）。
  */
 import { Runtime } from "../core/runtime.ts";
+import { Logger } from "../core/logger.ts";
 
 async function main(): Promise<number> {
   console.log("M2 多账号运行时启动");
 
-  const dataDir = Deno.env.get("CTYUNPC_DATA_DIR");
-  const runtime = await Runtime.start(dataDir);
+  const logDir = Deno.env.get("CTYUNPC_LOG_DIR");
+  const runtime = await Runtime.start(
+    logDir ? new Logger({ verbose: true, logDir }) : undefined,
+  );
+  void runtime;
 
   console.log("运行时已启动，按 Ctrl+C 退出");
 

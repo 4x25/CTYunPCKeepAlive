@@ -1,8 +1,9 @@
 /**
  * 事件总线：用于状态变更通知。
  *
- * 简单的发布-订阅模式，支持通配符订阅。
+ * 简单的发布-订阅模式，支持通配符 `*` 订阅（SSE 层用它捕获所有变更）。
  */
+import type { LogRecord } from "./logger.ts";
 
 export type EventType =
   | "account:added"
@@ -29,22 +30,34 @@ export type EventPayload = {
   "device:keepalive-start": { account: string; objId: string };
   "device:keepalive-success": { account: string; objId: string; duration: number };
   "device:keepalive-failed": { account: string; objId: string; error: string };
-  "log:entry": { level: string; module: string; message: string };
+  "log:entry": LogRecord;
   "state:snapshot": Record<string, unknown>;
 };
 
 type Listener<T extends EventType> = (payload: EventPayload[T]) => void;
+type WildcardListener = (payload: unknown) => void;
 
 class EventBus {
   private listeners = new Map<EventType, Set<Listener<EventType>>>();
+  private wildcardListeners = new Set<WildcardListener>();
 
-  on<T extends EventType>(type: T, listener: Listener<T>): () => void {
-    if (!this.listeners.has(type)) {
-      this.listeners.set(type, new Set());
+  on<T extends EventType>(type: T, listener: Listener<T>): () => void;
+  on(type: "*", listener: WildcardListener): () => void;
+  on<T extends EventType | "*">(
+    type: T,
+    listener: T extends "*" ? WildcardListener : Listener<EventType>,
+  ): () => void {
+    if (type === "*") {
+      this.wildcardListeners.add(listener as WildcardListener);
+      return () => this.wildcardListeners.delete(listener as WildcardListener);
     }
-    this.listeners.get(type)!.add(listener as Listener<EventType>);
 
-    return () => this.off(type, listener);
+    if (!this.listeners.has(type as EventType)) {
+      this.listeners.set(type as EventType, new Set());
+    }
+    this.listeners.get(type as EventType)!.add(listener as Listener<EventType>);
+
+    return () => this.off(type as EventType, listener as Listener<EventType>);
   }
 
   off<T extends EventType>(type: T, listener: Listener<T>): void {
@@ -52,6 +65,7 @@ class EventBus {
   }
 
   emit<T extends EventType>(type: T, payload: EventPayload[T]): void {
+    // 触发具体事件的监听器
     const handlers = this.listeners.get(type);
     if (handlers) {
       for (const handler of handlers) {
@@ -60,6 +74,15 @@ class EventBus {
         } catch (err) {
           console.error(`事件处理器异常 [${type}]:`, err);
         }
+      }
+    }
+
+    // 触发通配符监听器
+    for (const handler of this.wildcardListeners) {
+      try {
+        handler(payload);
+      } catch (err) {
+        console.error(`通配符事件处理器异常 [${type}]:`, err);
       }
     }
   }

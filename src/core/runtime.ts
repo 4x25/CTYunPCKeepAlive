@@ -16,6 +16,8 @@ import { performKeepalive } from "./keepalive.ts";
 
 const MAX_ACCOUNTS = 10;
 const DEFAULT_INTERVAL_MINUTES = 19;
+const MIN_INTERVAL_MINUTES = 1;
+const MAX_INTERVAL_MINUTES = 59;
 const JITTER_MAX_MS = 20_000; // 0-20s 随机抖动
 
 export class Runtime {
@@ -35,10 +37,11 @@ export class Runtime {
     bus.on("device:updated", () => this.#scheduleAutoSave());
   }
 
-  /** 从配置文件启动 */
-  static async start(logDir?: string | undefined): Promise<Runtime> {
+  /** 从配置文件启动。传入 logger 时复用它（服务端需要把日志接到 SSE）。 */
+  static async start(logger?: Logger): Promise<Runtime> {
     const config = await loadConfig();
-    const log = new Logger({ verbose: true, logDir: logDir ?? undefined });
+    sanitizeConfig(config);
+    const log = logger ?? new Logger({ verbose: true });
     const runtime = new Runtime(config, log);
 
     // 加载所有账号
@@ -123,6 +126,20 @@ export class Runtime {
     this.#log.info("账号", `账号已删除：${account}`);
   }
 
+  /** 更新账号别名 */
+  async updateAccountAlias(account: string, alias: string): Promise<void> {
+    const actor = this.#accounts.get(account);
+    if (!actor) throw new Error(`账号不存在：${account}`);
+
+    const config = actor.getConfig();
+    config.alias = alias;
+    actor.updateConfig(config);
+
+    state.updateAccount(account, { alias: alias || undefined });
+    await this.#saveConfig();
+    this.#log.info("账号", `别名已更新：${account} -> ${alias || "(无)"}`);
+  }
+
   /** 更新设备自动保活配置 */
   async setAutoKeepalive(account: string, objId: string, enabled: boolean): Promise<void> {
     const actor = this.#accounts.get(account);
@@ -151,8 +168,14 @@ export class Runtime {
     objId: string,
     intervalMinutes: number,
   ): Promise<void> {
-    if (intervalMinutes < 1 || intervalMinutes > 59) {
-      throw new Error("间隔必须在 1-59 分钟之间");
+    if (
+      !Number.isInteger(intervalMinutes) ||
+      intervalMinutes < MIN_INTERVAL_MINUTES ||
+      intervalMinutes > MAX_INTERVAL_MINUTES
+    ) {
+      throw new Error(
+        `间隔必须是 ${MIN_INTERVAL_MINUTES}-${MAX_INTERVAL_MINUTES} 的整数`,
+      );
     }
 
     const actor = this.#accounts.get(account);
@@ -184,9 +207,15 @@ export class Runtime {
     const device = state.getDevice(account, objId);
     if (!device) return Promise.resolve();
 
+    // 防御：非有限或越界的间隔会产生 NaN 的 scheduledAt，
+    // 而 `NaN > now` 恒为 false，会让任务无限重排打满 CPU。
+    const minutes = Number.isFinite(delayMinutes) && delayMinutes > 0
+      ? Math.min(delayMinutes, MAX_INTERVAL_MINUTES)
+      : 0;
+
     // 添加随机抖动
     const jitter = Math.floor(Math.random() * JITTER_MAX_MS);
-    const delay = delayMinutes * 60_000 + jitter;
+    const delay = minutes * 60_000 + jitter;
     const scheduledAt = Date.now() + delay;
 
     const task = {
@@ -196,6 +225,20 @@ export class Runtime {
       scheduledAt,
       priority: delayMinutes === 0 ? 0 : 1, // 手动触发优先级高
       execute: async () => {
+        // 关机 / 禁止连接 / 需排队的设备：跳过本轮，且不重试。
+        // 需求稿明确「从不代为开机」，反复重试只会刷屏失败日志。
+        const fresh = state.getDevice(account, objId);
+        if (fresh && (!fresh.isRunning || fresh.isForbidden)) {
+          const reason = fresh.isForbidden ? "设备禁止连接" : "设备已关机";
+          this.#log.info("调度", `跳过保活：${fresh.name}（${reason}）`);
+          state.updateDevice(account, objId, { keepaliveState: "idle" });
+          // 仍安排下一次，等设备开机后能自动恢复
+          if (fresh.autoKeepalive) {
+            await this.#scheduleKeepalive(account, objId, fresh.intervalMinutes);
+          }
+          return;
+        }
+
         const auth = await actor.ensureAuth();
         state.updateDevice(account, objId, { keepaliveState: "running" });
 
@@ -219,7 +262,10 @@ export class Runtime {
             lastKeepaliveError: msg,
           });
 
-          // 失败不回弹开关
+          // 手动触发失败时把错误抛给调用方；自动保活失败仅记录，并由下方重排下一轮
+          if (device.autoKeepalive) {
+            await this.#scheduleKeepalive(account, objId, device.intervalMinutes);
+          }
           throw err;
         }
       },
@@ -278,5 +324,29 @@ export class Runtime {
   /** 获取日志记录 */
   getLogs() {
     return this.#log.records();
+  }
+}
+
+/**
+ * 清洗配置中的非法值。
+ *
+ * 进程崩溃或用户手改都可能留下坏数据；`NaN` / 越界的间隔会让调度器
+ * 陷入无限重排，必须在进入调度前修掉。
+ */
+function sanitizeConfig(config: Config): void {
+  for (const account of config.accounts) {
+    for (const [objId, device] of Object.entries(account.devices ?? {})) {
+      const minutes = device.intervalMinutes;
+      if (
+        !Number.isInteger(minutes) ||
+        minutes < MIN_INTERVAL_MINUTES ||
+        minutes > MAX_INTERVAL_MINUTES
+      ) {
+        device.intervalMinutes = DEFAULT_INTERVAL_MINUTES;
+        console.warn(
+          `[配置] 设备 ${objId} 的间隔非法（${minutes}），已重置为 ${DEFAULT_INTERVAL_MINUTES}`,
+        );
+      }
+    }
   }
 }

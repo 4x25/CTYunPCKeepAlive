@@ -2,8 +2,10 @@
  * 全局状态快照。
  *
  * 记录所有账号和设备的当前状态，供 UI 渲染和事件总线推送。
+ * 每次变更都会 emit `state:snapshot`，SSE 层据此推送增量。
  */
 import type { DesktopEntry } from "./ctyun/desktops.ts";
+import { bus } from "./bus.ts";
 
 export type AccountState = "normal" | "logging-in" | "login-failed" | "intervention-required";
 
@@ -64,6 +66,12 @@ export class StateStore {
     revision: 0,
   };
 
+  /** 每次变更后广播，SSE 层订阅它。 */
+  #changed(): void {
+    this.state.revision++;
+    bus.emit("state:snapshot", { revision: this.state.revision });
+  }
+
   getSnapshot(): GlobalState {
     return structuredClone(this.state);
   }
@@ -73,7 +81,7 @@ export class StateStore {
     if (idx === -1) return;
 
     this.state.accounts[idx] = { ...this.state.accounts[idx]!, ...updates };
-    this.state.revision++;
+    this.#changed();
   }
 
   updateDevice(
@@ -88,17 +96,17 @@ export class StateStore {
     if (idx === -1) return;
 
     acc.devices[idx] = { ...acc.devices[idx]!, ...updates };
-    this.state.revision++;
+    this.#changed();
   }
 
   addAccount(snapshot: AccountSnapshot): void {
     this.state.accounts.push(snapshot);
-    this.state.revision++;
+    this.#changed();
   }
 
   removeAccount(account: string): void {
     this.state.accounts = this.state.accounts.filter((a) => a.account !== account);
-    this.state.revision++;
+    this.#changed();
   }
 
   setDevices(account: string, devices: DeviceSnapshot[]): void {
@@ -107,7 +115,7 @@ export class StateStore {
 
     acc.devices = devices;
     acc.devicesRefreshedAt = Date.now();
-    this.state.revision++;
+    this.#changed();
   }
 
   getAccount(account: string): AccountSnapshot | undefined {
