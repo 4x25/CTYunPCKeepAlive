@@ -8,11 +8,11 @@
 | 项 | 值 |
 | --- | --- |
 | 分支 | `refactor/2.0.0` |
-| 当前里程碑 | **M0 ✅ 完成**（真账号门禁全过） |
+| 当前里程碑 | **M1 🟡 进行中**（代码已完成，等待验证码窗口过期后实测） |
 | 上次更新 | 2026-09-13 |
-| 阻塞项 | 无 |
+| 阻塞项 | 登录触发图形验证码，需等待时间窗口 |
 
-**下一步动作**：开 M1（Clink 保活管线）。测试账号下有 1 台 Windows 云电脑且处于运行中，满足 M1 联调条件。
+**下一步动作**：等待验证码窗口过期（通常 5-10 分钟），重试 `keepalive` 完成 M1 门禁验证。所有代码已就绪，56 个单测全过。
 
 ### M0 实测结论（真账号）
 
@@ -32,7 +32,7 @@
 | # | 名称 | 状态 | 门禁（必须真账号验证） |
 | --- | --- | --- | --- |
 | M0 | 地基与登录探针 | ✅ 完成 | 真账号登录成功 + `pageDesktop` 返回设备 |
-| M1 | Clink 保活管线 | ⬜ 未开始 | 就绪掩码达到 `0x0e` |
+| M1 | Clink 保活管线 | 🟡 进行中 | 就绪掩码达到 `0x0e` |
 | M2 | 多账号运行时 | ⬜ 未开始 | 2 账号 × 90 分钟无漂移 |
 | M3 | Web UI | ⬜ 未开始 | 浏览器内完成全部保活操作 |
 | M4 | 积分任务 | ⬜ 未开始 | 三个任务在一个时间窗内全部完成 |
@@ -71,25 +71,25 @@
 
 **目的**：跑通四步管线。这是整个工具的核心价值，也是唯一无法靠文档推导、必须实连验证的部分。
 
-- [ ] `clink/frame.ts`：`ClinkHeader`(16B) / `ClientLink` / `ServerLink` / mini header(6B)，全部 little-endian
-- [ ] `clink/reassembler.ts`：跨 WS frame 字节流重组（文档实测出现过 `194+4+4` 拆帧与单帧多消息）
-- [ ] `clink/ticket.ts`：162B SPKI DER → RSA-OAEP/SHA-1 加密单个 NUL → `auth_mechanism=1` + 128B = 132B
-- [ ] `clink/channel.ts`：单通道状态机 `CONNECTING → OPEN → START → LINK → TICKET → READY`，**自实现 15s 超时**（上游定时器回调为空）
-- [ ] `core/ctyun/ws.ts`：WS 窄接口 `connect(url, {protocols, headers})`，内置 `WebSocket` 实现。
+- [x] `clink/frame.ts`：`ClinkHeader`(16B) / `ClientLink` / `ServerLink` / mini header(6B)，全部 little-endian
+- [x] `clink/reassembler.ts`：跨 WS frame 字节流重组（文档实测出现过 `194+4+4` 拆帧与单帧多消息）
+- [x] `clink/ticket.ts`：162B SPKI DER → RSA-OAEP/SHA-1 加密单个 NUL → `auth_mechanism=1` + 128B = 132B
+- [x] `clink/channel.ts`：单通道状态机 `CONNECTING → OPEN → START → LINK → TICKET → READY`，**自实现 15s 超时**（上游定时器回调为空）
+- [x] `core/ctyun/ws.ts`：WS 窄接口 `connect(url, {protocols, headers})`，内置 `WebSocket` 实现。
       **`protocols` 必须传数组**：`new WebSocket(url, { protocols: ["binary"], headers })`。
       窄接口保留用于单测注入假 transport，不因选型确定而删除
-- [ ] `clink/session.ts`：MAIN 编排
-  - [ ] `CUSTOM(118)` 身份 JSON
-  - [ ] `CLIENT_LOGIN_INFO(112)`：**UTF-16 低字节写入**，不是 UTF-8（否则长度与偏移全错）
-  - [ ] `LOGIN_INFO_EARLY` 能力判定 → 等或不等 `LOGIN_INFO_RES(136)`
-  - [ ] `ATTACH_CHANNELS(104)` → `CHANNELS_LIST(104)`
-  - [ ] DISPLAY：`DISPLAY_SETTING(108)` 用**最低画质** + `DISPLAY_INIT(101)`
-  - [ ] INPUTS
-  - [ ] 就绪掩码 `0x0e` 判定 + 三通道关闭
-- [ ] `core/ctyun/connect.ts`：`queryConnectData` ‖ `connect` 竞速（**普通请求失败即整轮失败**）、`connectUrl` 前两地址轮询、`connectMaster === 1` 分支
-- [ ] `core/keepalive.ts`：四步编排、45s 硬上限、**重试必须从 ① 重来**
-- [ ] `core/errors.ts`：失败分类雏形（`auth_code=7` 会话冲突不重试不通知；`8/9` 协议类不重试；「101 失败」与「代理未返回 `0x01`」记为两个独立错误类）
-- [ ] CLI：`deno task keepalive -- <account> <objName>`
+- [x] `clink/session.ts`：MAIN 编排
+  - [x] `CUSTOM(118)` 身份 JSON
+  - [x] `CLIENT_LOGIN_INFO(112)`：**UTF-16 低字节写入**，不是 UTF-8（否则长度与偏移全错）
+  - [x] `LOGIN_INFO_EARLY` 能力判定 → 等或不等 `LOGIN_INFO_RES(136)`
+  - [x] `ATTACH_CHANNELS(104)` → `CHANNELS_LIST(104)`
+  - [x] DISPLAY：`DISPLAY_SETTING(108)` 用**最低画质** + `DISPLAY_INIT(101)`
+  - [x] INPUTS
+  - [x] 就绪掩码 `0x0e` 判定 + 三通道关闭
+- [x] `core/ctyun/connect.ts`：`queryConnectData` ‖ `connect` 竞速（**普通请求失败即整轮失败**）、`connectUrl` 前两地址轮询、`connectMaster === 1` 分支
+- [x] `core/keepalive.ts`：四步编排、45s 硬上限、**重试必须从 ① 重来**
+- [x] `core/errors.ts`：失败分类雏形（`auth_code=7` 会话冲突不重试不通知；`8/9` 协议类不重试；「101 失败」与「代理未返回 `0x01`」记为两个独立错误类）
+- [x] CLI：`deno task keepalive -- <account> <objName>`
 
 **门禁**
 - [ ] 三通道 `auth_code=0`，就绪掩码 `0x0e`，输出单条 INFO 含总耗时

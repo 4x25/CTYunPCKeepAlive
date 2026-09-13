@@ -105,3 +105,28 @@ export function serializeClientLink(msg: ClientLink, isFirst: boolean): Uint8Arr
     return result;
   }
 }
+
+/**
+ * 解析服务端消息。
+ *
+ * reassembler 已经完成了跨帧重组，这里只需要解析头部。
+ */
+export function parseServerLink(buf: Uint8Array, isFirst: boolean): ServerLink {
+  if (isFirst && buf.length >= 16) {
+    const header = parseClinkHeader(buf);
+    return {
+      type: header.type,
+      sessionId: header.sessionId,
+      payload: buf.slice(16),
+    };
+  } else if (buf.length >= 6) {
+    const header = parseMiniHeader(buf);
+    return {
+      type: header.type,
+      payload: buf.slice(6),
+    };
+  } else {
+    throw new Error(`帧太短：${buf.length} 字节`);
+  }
+}
+
