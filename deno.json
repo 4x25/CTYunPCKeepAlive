@@ -1,0 +1,39 @@
+{
+  "nodeModulesDir": "auto",
+  "lock": true,
+  "imports": {
+    "@hono/hono": "jsr:@hono/hono@^4.13.7",
+    "@std/assert": "jsr:@std/assert@^1",
+    "@std/encoding": "jsr:@std/encoding@^1",
+    "@std/path": "jsr:@std/path@^1",
+    "tailwindcss": "npm:tailwindcss@^4.3.3",
+    "daisyui": "npm:daisyui@^5.5.23",
+    "@tailwindcss/cli": "npm:@tailwindcss/cli@^4.3.3"
+  },
+  "compilerOptions": {
+    "jsx": "precompile",
+    "jsxImportSource": "@hono/hono/jsx",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true
+  },
+  "tasks": {
+    "probe": "deno run --env-file --allow-env --allow-net --allow-read src/cli/probe.ts",
+    "test": "deno test --allow-env --allow-read",
+    "check": "deno check src/ && deno lint && deno fmt --check"
+  },
+  "lint": {
+    "include": ["src/"],
+    "rules": {
+      "tags": ["recommended"],
+      "include": ["no-sync-fn-in-async-fn", "no-throw-literal", "eqeqeq"]
+    }
+  },
+  "fmt": {
+    "include": ["src/"],
+    "lineWidth": 100,
+    "semiColons": true,
+    "singleQuote": false
+  },
+  "exclude": ["dist/", "assets/app.css", "assets/client.js", "docs/bundle-snapshots/"]
+}

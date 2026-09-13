@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+
+node_modules/
+dist/
+
+# 构建产物
+assets/app.css
+assets/client.js
+
+# 本地运行时数据
+*.log
+*.jsonl
