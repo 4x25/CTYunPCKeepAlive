@@ -1,4 +1,5 @@
 import { unsafeWindow } from "$";
+import dayjs from "dayjs";
 import { memoize } from "lodash-es";
 import nativeFunctions, { clearTimeout, setTimeout } from "./nativeFunctions";
 import useLog from "../hooks/useLog";
@@ -191,36 +192,50 @@ export function doMission4(onLog = useLog.getState().addLog) {
       "position: fixed; top: 100vh; display: block; width: 1920px; height: 1080px;",
     );
     iframe.onload = async () => {
-      await wait(10 * 1000);
-      const location = iframe.contentWindow?.location;
-      const document = iframe.contentWindow?.document;
-      if (
-        !location ||
-        location.origin !== "https://eaichat.ctyun.cn" ||
-        location.hash.startsWith("#/login")
-      ) {
-        onLog("【AI任务】失败：未检测到登录信息");
-        useSettings.getState().setAutoMission4(false);
-        reject(new Error("未检测到登录信息"));
-        return;
+      iframe.onload = null;
+      try {
+        onLog("【AI任务】页面已加载，等待3秒后填写提问");
+        await wait(3 * 1000);
+        const location = iframe.contentWindow?.location;
+        const document = iframe.contentWindow?.document;
+        if (
+          !location ||
+          location.origin !== "https://eaichat.ctyun.cn" ||
+          location.hash.startsWith("#/login")
+        ) {
+          useSettings.getState().setAutoMission4(false);
+          throw new Error("未检测到登录信息");
+        }
+        const input = document?.querySelector<HTMLElement>(
+          '.input-box[contenteditable="true"]',
+        );
+        if (!input) {
+          throw new Error("未找到提问输入框");
+        }
+        const question = `${dayjs().format("YYYY年MM月DD日")}新闻`;
+        input.innerText = question;
+        onLog(`【AI任务】[2/3] 已填写提问：${question}，等待3秒后发送`);
+        await wait(3 * 1000);
+        const sendButton = document?.querySelector<HTMLElement>(
+          ".iconfont-v3.icon-v3-fasong",
+        );
+        if (!sendButton) {
+          throw new Error("未找到发送按钮");
+        }
+        sendButton.click();
+        onLog("【AI任务】[3/3] 已点击发送按钮，等待3秒后清理页面");
+        await wait(3 * 1000);
+        onLog("【AI任务】提问发送流程完成");
+        resolve();
+      } catch (error) {
+        onLog(`【AI任务】失败：${(error as Error).message}`);
+        reject(error);
+      } finally {
+        iframe.remove();
+        onLog("【AI任务】页面已清理");
       }
-      const targets = Array.from(
-        document?.querySelectorAll<HTMLDivElement>(
-          "#main-container .welcome + .msg-main-wrap > .flex-container > .flex-item > .msg-sub-wrap",
-        ) || [],
-      );
-      const target = targets[Math.floor(Math.random() * targets.length)];
-      if (!target) {
-        onLog("【AI任务】失败：未找到快捷提问模块");
-        reject(new Error("未找到快捷提问模块"));
-        return;
-      }
-      target.click();
-      await wait(3 * 1000);
-      onLog("【AI任务】完成");
-      iframe.remove();
-      resolve();
     };
+    onLog("【AI任务】[1/3] 打开 https://eaichat.ctyun.cn/chat/#/aichat");
     document.body.appendChild(iframe);
   });
 }
