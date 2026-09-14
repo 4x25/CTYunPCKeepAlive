@@ -13,6 +13,17 @@ export interface AccountConfig {
   password: string;
   /** 用户自定义别名（可选） */
   alias?: string;
+  /**
+   * Web 设备代码（`web_` + 32 位随机）。
+   *
+   * 必须在首次登录后持久化并长期复用 —— 每次重新生成会被服务端视为
+   * 新客户端，反复触发设备绑定校验。
+   */
+  deviceCode?: string;
+  /** IAM 设备代码（`iam:` + 32 位随机）。同样必须长期复用。 */
+  eaiDeviceCode?: string;
+  /** 云智助手 Web 标识（`pubweb_` + UUID v4）。参与每个请求的 `x-eai-xuid`。 */
+  eaiXuid?: string;
   /** 设备保活配置，key 是 objId */
   devices: Record<string, DeviceConfig>;
 }
@@ -24,9 +35,30 @@ export interface DeviceConfig {
   intervalMinutes: number;
 }
 
+/** 积分任务设置（每账号一份）。 */
+export interface PointsConfig {
+  /** 时间窗开始（分钟数，0–1439）。 */
+  windowStartMinutes: number;
+  /** 时间窗结束（分钟数，0–1439）。 */
+  windowEndMinutes: number;
+  /** 已开启自动执行的任务定义 ID。 */
+  autoTasks: number[];
+  /** 1 小时任务使用的设备 objId；未指定时取第一台运行中的设备。 */
+  usageObjId?: string;
+}
+
+/** 时间窗默认值：09:00–11:30。 */
+export const DEFAULT_POINTS_CONFIG: PointsConfig = {
+  windowStartMinutes: 9 * 60,
+  windowEndMinutes: 11 * 60 + 30,
+  autoTasks: [],
+};
+
 export interface Config {
   version: 1;
   accounts: AccountConfig[];
+  /** 积分设置，key 是账号。 */
+  points?: Record<string, PointsConfig>;
 }
 
 const DEFAULT_CONFIG: Config = {

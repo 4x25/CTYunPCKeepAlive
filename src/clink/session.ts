@@ -20,6 +20,13 @@ import { encodeMiniHeader, parseServerLink, serializeClientLink } from "./frame.
 import { generateTicket } from "./ticket.ts";
 
 export interface ClinkSessionOptions {
+  /**
+   * 保持模式：握手完成后**不关闭**通道，直到调用方主动 {@link ClinkSession.close}。
+   *
+   * 积分任务 1003（使用 1 小时）需要它；普通保活用不到，保持默认 false
+   * 以便握手成功后立即释放。
+   */
+  hold?: boolean;
   /** 云电脑 objId。 */
   desktopId: string;
   /** 用户 ID（登录态）。 */
@@ -49,8 +56,11 @@ const MSG = {
   DISPLAY_INIT: 101,
   CHANNELS_LIST: 104,
   LOGIN_INFO_RES: 136,
+  /** 流控窗口通告。**必须**回复 `ACK_SYNC`，否则服务端会停止推流。 */
+  SET_ACK: 3,
 
   // Client → Server
+  ACK_SYNC: 1,
   CUSTOM: 118,
   CLIENT_LOGIN_INFO: 112,
   ATTACH_CHANNELS: 104,
@@ -69,6 +79,9 @@ export class ClinkSession {
   #readyMask = 0;
   #authCodes = { main: 0, display: 0, inputs: 0 };
   #waitingForLoginInfoRes = false;
+  /** 保持模式下，链路断开时 resolve 这个 promise。 */
+  #closedResolve?: () => void;
+  #closed = false;
 
   constructor(ws: WebSocketLike, opts: ClinkSessionOptions) {
     this.#opts = opts;
@@ -132,9 +145,28 @@ export class ClinkSession {
       this.#onLoginInfoRes(msg.payload);
     } else if (msg.type === MSG.CHANNELS_LIST) {
       this.#onChannelsList();
+    } else if (msg.type === MSG.SET_ACK) {
+      this.#onSetAck(msg.payload);
     } else if (msg.type === MSG.DISPLAY_INIT) {
       // DISPLAY 通道已 READY，不需要额外处理
     }
+  }
+
+  /**
+   * 应答服务端流控窗口。
+   *
+   * 文档明确这是**必答**的：不回 `ACK_SYNC` 服务端会停止推流，
+   * 1 小时任务会因此被判失败。payload 是 `generation:uint32 + window:uint32`，
+   * 回包只需原样带回 `generation`。
+   */
+  #onSetAck(payload: Uint8Array): void {
+    if (payload.length < 4) return;
+    const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    const generation = view.getUint32(0, true);
+
+    const reply = new Uint8Array(4);
+    new DataView(reply.buffer).setUint32(0, generation, true);
+    this.#sendMini(MSG.ACK_SYNC, reply);
   }
 
   #onStart(data: Uint8Array): void {
@@ -247,14 +279,57 @@ export class ClinkSession {
       authCodes: this.#authCodes,
       elapsedMs: Math.round(performance.now() - this.#startTime),
     };
+
+    if (this.#opts.hold) {
+      // 保持模式：通道留着，只把「就绪」告知调用方
+      this.#resolve?.(result);
+      return;
+    }
+
     this.#ws.close();
     this.#channel.dispose();
     this.#resolve?.(result);
   }
 
+  /**
+   * 主动关闭（保持模式下由调用方调用）。
+   *
+   * 幂等：重复调用无副作用。
+   */
+  close(): void {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#channel.dispose();
+    try {
+      this.#ws.close();
+    } catch {
+      // 已关闭时忽略
+    }
+    this.#closedResolve?.();
+  }
+
+  /**
+   * 等待连接结束（保持模式下用）。
+   *
+   * 只要服务端或网络把连接断掉就 resolve —— 上层据此判断 1 小时任务
+   * 是否被中断。**不重连**：文档要求被踢时不回收。
+   */
+  waitClosed(): Promise<void> {
+    if (this.#closed) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.#closedResolve = resolve;
+    });
+  }
+
   #fail(reason: string): void {
     this.#channel.fail(reason);
-    this.#ws.close();
+    this.#closed = true;
+    try {
+      this.#ws.close();
+    } catch {
+      // 忽略
+    }
+    this.#closedResolve?.();
     this.#reject?.(new Error(reason));
   }
 
@@ -263,7 +338,11 @@ export class ClinkSession {
   }
 
   #onClose(ev: CloseEvent): void {
-    if (!this.#resolve && !this.#reject) return;
+    const wasClosed = this.#closed;
+    this.#closed = true;
+    this.#closedResolve?.();
+
+    if (wasClosed) return;
     if (this.#readyMask !== 0x0e) {
       this.#fail(`WebSocket 提前关闭（code=${ev.code}, reason=${ev.reason}）`);
     }

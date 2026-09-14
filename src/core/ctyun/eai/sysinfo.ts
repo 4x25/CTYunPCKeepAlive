@@ -1,67 +1,62 @@
 /**
- * 云智助手系统信息获取与解密。
+ * 云智助手 SSO 配置获取与解密。
  *
- * 依据 `docs/ctyun-eaichat-api.md` §3。
- *
- * `eaiSysInfo` 返回 AES-ECB 加密的 JSON，key 是固定的 `chinatelecom@cnn`
- * （16 字节恰好是 AES-128 的 key 长度）。解密后的 `sso.ssopk` / `ssopkid`
- * 用于后续的 IAM 登录流程。
+ * 依据 `docs/ctyun-eaichat-account-auth-api.md` §3。
  */
-import { createCipheriv, createDecipheriv } from "node:crypto";
+import { createDecipheriv } from "node:crypto";
 
-// 16 字节恰好是 AES-128 的 key 长度
+/** `eaiSysInfo` 的 `data` 字段用这个固定 key 做 AES-ECB 解密。 */
 const SYSINFO_KEY = Buffer.from("chinatelecom@cnn", "utf8");
-// ECB 不需要 IV，但 API 要求传参
-const NO_IV = Buffer.alloc(0);
+
+/** 该接口跨域，浏览器会先发 OPTIONS 预检。 */
+export const EAI_SYSINFO_URL = "https://gwyilian.ctyun.cn/server/eaiSysInfo";
+
+/** 解密后的 SSO 配置中，登录流程实际消费的字段。 */
+export interface EaiSsoConfig {
+  /** 云智助手 API 网关地址。 */
+  eai?: string;
+  sso: {
+    /** 用于加密客户端随机密钥的 RSA 公钥（PEM 文本）。 */
+    ssopk: string;
+    /** 公钥标识，提交为 `clientKeyId`。 */
+    ssopkid: string;
+  };
+}
+
+/** 线上响应外层。`data` 是 AES-ECB 加密的 JSON 字符串。 */
+interface EaiSysInfoResponse {
+  success?: boolean;
+  resultCode?: string;
+  resultMsg?: string;
+  /** 加密后的平台网关配置。 */
+  data?: string;
+}
 
 /**
- * AES-ECB 解密（固定 key）。
+ * 用固定 key 做 AES-ECB / PKCS#7 解密。
  *
- * 云智助手这条链路用 ECB 而不是云电脑链的 CBC，且 key 是明文常量。
+ * 注意云智助手这条链用的是 ECB，不是云电脑链的 CBC。
  */
-export function aesEcbDecrypt(cipherBase64: string): string {
-  const decipher = createDecipheriv("aes-128-ecb", SYSINFO_KEY, NO_IV);
+export function decryptEaiSysInfo(cipherBase64: string): string {
+  const decipher = createDecipheriv("aes-128-ecb", SYSINFO_KEY, null);
   let plain = decipher.update(cipherBase64, "base64", "utf8");
   plain += decipher.final("utf8");
   return plain;
 }
 
 /**
- * AES-ECB 加密（固定 key）。
+ * 获取并解析 SSO 配置。
  *
- * 仅用于单测验证，生产代码不需要加密 sysinfo。
- */
-export function aesEcbEncrypt(plain: string): string {
-  const cipher = createCipheriv("aes-128-ecb", SYSINFO_KEY, NO_IV);
-  let enc = cipher.update(plain, "utf8", "base64");
-  enc += cipher.final("base64");
-  return enc;
-}
-
-export interface SysInfo {
-  sso: {
-    ssopk: string;
-    ssopkid: string;
-  };
-}
-
-export interface EaiSysInfoResponse {
-  resultCode: string;
-  resultMessage: string;
-  sysInfo: string; // AES-ECB 加密的 JSON
-}
-
-/**
- * 获取并解密云智助手系统信息。
- *
- * 该接口不需要登录态，但响应是加密的；解密后拿到的 `ssopk` / `ssopkid`
+ * 该接口不需要登录态，但响应体是加密的；解密后的 `ssopk` / `ssopkid`
  * 用于后续 IAM 登录的 `clientKey` 加密。
+ *
+ * 解密后的完整配置字段超出登录所需范围（文档明确不作扩展），
+ * 这里只取登录要用的部分，其余原样保留。
  */
 export async function getEaiSysInfo(
-  fetch: typeof globalThis.fetch,
-): Promise<SysInfo> {
-  const url = "https://eaichat.ctyun.cn/api/v1/sysInfo/eaiSysInfo";
-  const res = await fetch(url, {
+  fetchImpl: typeof fetch = fetch,
+): Promise<EaiSsoConfig> {
+  const res = await fetchImpl(EAI_SYSINFO_URL, {
     headers: {
       "Accept": "application/json, text/plain, */*",
       "Origin": "https://eaichat.ctyun.cn",
@@ -73,10 +68,17 @@ export async function getEaiSysInfo(
   }
 
   const body = await res.json() as EaiSysInfoResponse;
-  if (body.resultCode !== "0") {
-    throw new Error(`eaiSysInfo failed: ${body.resultMessage} (${body.resultCode})`);
+  if (!body.data) {
+    throw new Error(
+      `eaiSysInfo 响应缺少 data 字段（resultCode=${body.resultCode ?? "?"}）`,
+    );
   }
 
-  const plain = aesEcbDecrypt(body.sysInfo);
-  return JSON.parse(plain) as SysInfo;
+  const parsed = JSON.parse(decryptEaiSysInfo(body.data)) as EaiSsoConfig;
+
+  if (!parsed.sso?.ssopk || !parsed.sso?.ssopkid) {
+    throw new Error("eaiSysInfo 解密后缺少 sso.ssopk / sso.ssopkid");
+  }
+
+  return parsed;
 }

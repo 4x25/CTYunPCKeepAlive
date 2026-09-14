@@ -29,17 +29,28 @@
     "server": "deno run --env-file --allow-env --allow-net --allow-read --allow-write src/server/main.ts",
     "dev": "deno task css && deno task client && deno task server",
     "test": "deno test --allow-env --allow-read",
-    "check": "deno check src/ && deno lint && deno fmt --check"
+    "check": "deno check src/ && deno lint && deno fmt --check",
+    "probe:eai": "deno run --env-file --allow-env --allow-net --allow-read src/cli/probe-eai.ts"
   },
   "lint": {
-    "include": ["src/"],
+    "include": [
+      "src/"
+    ],
     "rules": {
-      "tags": ["recommended"],
-      "include": ["no-sync-fn-in-async-fn", "no-throw-literal", "eqeqeq"]
+      "tags": [
+        "recommended"
+      ],
+      "include": [
+        "no-sync-fn-in-async-fn",
+        "no-throw-literal",
+        "eqeqeq"
+      ]
     }
   },
   "fmt": {
-    "include": ["src/"],
+    "include": [
+      "src/"
+    ],
     "lineWidth": 100,
     "semiColons": true,
     "singleQuote": false

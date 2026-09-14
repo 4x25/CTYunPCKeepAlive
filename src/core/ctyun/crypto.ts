@@ -50,6 +50,25 @@ export function aesEcbDecrypt(key: Uint8Array, base64Ciphertext: string): string
   return Buffer.concat([decipher.update(ct), decipher.final()]).toString("utf8");
 }
 
+/** AES-ECB / PKCS#7 加密，输出 Base64。仅单测与对称验证用。 */
+export function aesEcbEncrypt(key: Uint8Array, plaintext: string): string {
+  const cipher = crypto.createCipheriv(aesEcbAlg(key), key, null);
+  return Buffer.concat([cipher.update(plaintext, "utf8"), cipher.final()]).toString("base64");
+}
+
+/**
+ * AES-ECB / PKCS#7 解密，输入**原始字节**（非 Base64），输出 UTF-8 字符串。
+ *
+ * `ticketAuthorize` 的 `sessionKey` 是 Base64 文本，先 Base64 解码再走这里。
+ */
+export function aesEcbDecryptBytes(key: Uint8Array, ciphertext: Uint8Array): string {
+  const decipher = crypto.createDecipheriv(aesEcbAlg(key), key, null);
+  return Buffer.concat([
+    decipher.update(Buffer.from(ciphertext)),
+    decipher.final(),
+  ]).toString("utf8");
+}
+
 export interface RsaKeyPair {
   /** SPKI DER 的标准 Base64，不含 PEM 头尾。作为 `certData` 提交。 */
   publicKeySpkiBase64: string;
