@@ -8,11 +8,11 @@
 | 项 | 值 |
 | --- | --- |
 | 分支 | `refactor/2.0.0` |
-| 当前里程碑 | **M4 🟡 进行中**（M3 完成） |
-| 上次更新 | 2026-09-14 01:10 |
+| 当前里程碑 | **M4 ✅ 基础架构完成**（等待真实账号验证） |
+| 上次更新 | 2026-09-14 02:45 |
 | 阻塞项 | 无 |
 
-**下一步动作**：M4 积分任务。需要第二套认证链（IAM + 云智助手），详见下方任务清单。
+**下一步动作**：用真实账号验证 IAM 登录链路 + AI 对话接口，然后实现任务编排层。
 
 **M3 实测结论**：
 - ✅ Tailwind 4.3.3 + daisyUI 5.5.23 构建链路（243 KB CSS，含全部组件类）
@@ -196,13 +196,13 @@
 
 **目的**：接入积分中心与云智助手两条独立链路。**这是复杂度最高的里程碑**，涉及第二套完全不同的认证体系。
 
-- [ ] `core/ctyun/points.ts`：`getUserPoints`（按 `pointType` 分组、只累加 `willOutDate === null`、只显示 `pointType=1`）、`getTaskList`（接口驱动渲染，按 `taskSort` 升序）
-- [ ] `core/ctyun/cookiejar.ts`：per-account，`desk.ctyun.cn`(IAM) 与 `eaichat.ctyun.cn` **共用一个 jar**；云电脑链不带 cookie
-- [ ] `core/ctyun/eai/sysinfo.ts`：`eaiSysInfo` + AES-ECB（key `chinatelecom@cnn`）解密 → `sso.ssopk` / `ssopkid`
-- [ ] `core/ctyun/eai/iam.ts`：IAM login（`password = SHA256(明文)`，与云电脑链算法不同）→ `returnUrl` 取一次性 ticket → `clientKey` RSA-PKCS1v15 加密 → `ticketAuthorize` → Base64+AES-ECB 解出内存 `sk`
-- [ ] 用户/租户初始化：`queryUserInfo` / `queryUserConfig` / `queryUserTenantInfo`，区分 `tenantIdStr`（头）与 `tenantId`（body）
-- [ ] `core/ctyun/eai/sign.ts`：`Web-Signature = SHA256(bodyMd5 & sk & timestamp & random)`，**必须基于最终发出的那份 JSON 字符串**
-- [ ] `core/ctyun/eai/chat.ts`：`/chat/completions` SSE，跨分块缓冲、按 `finish_reason="stop"` + 流关闭结束（**无 `[DONE]`**）、90s 预算、模型回退（`status === "avaiable"` 拼写照抄 + 排除集合 + 复用同一 `verify_id`）
+- [x] `core/ctyun/points.ts`：`getUserPoints`（按 `pointType` 分组、只累加 `willOutDate === null`、只显示 `pointType=1`）、`getTaskList`（接口驱动渲染，按 `taskSort` 升序）
+- [x] `core/ctyun/cookiejar.ts`：per-account，`desk.ctyun.cn`(IAM) 与 `eaichat.ctyun.cn` **共用一个 jar**；云电脑链不带 cookie
+- [x] `core/ctyun/eai/sysinfo.ts`：`eaiSysInfo` + AES-ECB（key `chinatelecom@cnn`）解密 → `sso.ssopk` / `ssopkid`
+- [x] `core/ctyun/eai/iam.ts`：IAM login（`password = SHA256(明文)`，与云电脑链算法不同）→ `returnUrl` 取一次性 ticket → `clientKey` RSA-PKCS1v15 加密 → `ticketAuthorize` → Base64+AES-ECB 解出内存 `sk`
+- [x] 用户/租户初始化：`queryUserInfo` / `queryUserConfig` / `queryUserTenantInfo`，区分 `tenantIdStr`（头）与 `tenantId`（body）
+- [x] `core/ctyun/eai/sign.ts`：`Web-Signature = SHA256(bodyMd5 & sk & timestamp & random)`，**必须基于最终发出的那份 JSON 字符串**
+- [x] `core/ctyun/eai/chat.ts`：`/chat/completions` SSE，跨分块缓冲、按 `finish_reason="stop"` + 流关闭结束（**无 `[DONE]`**）、90s 预算、模型回退（`status === "avaiable"` 拼写照抄 + 排除集合 + 复用同一 `verify_id`）
 - [ ] 任务 1002（登录）：一次登录调用，**最先执行**（顺带验证会话）
 - [ ] 任务 1004（AI 对话）：探测 `modeltype` → 失效则重走 IAM 链 → 固定提示词，首个带 `delta.content` 的事件即成功并 abort，**不解析回答、不落盘问答**
 - [ ] 任务 1003（使用 1 小时）：复用保活 ①②③ 并保持三通道
