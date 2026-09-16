@@ -206,9 +206,7 @@ export function doMission4(onLog = useLog.getState().addLog) {
           useSettings.getState().setAutoMission4(false);
           throw new Error("未检测到登录信息");
         }
-        const input = document?.querySelector<HTMLElement>(
-          '.input-box[contenteditable="true"]',
-        );
+        const input = document?.querySelector<HTMLElement>('.input-box[contenteditable="true"]');
         if (!input) {
           throw new Error("未找到提问输入框");
         }
@@ -216,9 +214,7 @@ export function doMission4(onLog = useLog.getState().addLog) {
         input.innerText = question;
         onLog(`【AI任务】[2/3] 已填写提问：${question}，等待3秒后发送`);
         await wait(3 * 1000);
-        const sendButton = document?.querySelector<HTMLElement>(
-          ".iconfont-v3.icon-v3-fasong",
-        );
+        const sendButton = document?.querySelector<HTMLElement>(".send-button:has( > .iconfont-v3.icon-v3-fasong)");
         if (!sendButton) {
           throw new Error("未找到发送按钮");
         }
