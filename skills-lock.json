@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "daisyui": {
+      "source": "saadeghi/daisyui",
+      "sourceType": "github",
+      "skillPath": "skills/daisyui/SKILL.md",
+      "computedHash": "f70b06883160802b5b04db0504647cc140bd38cf7eb941183a38f44a179b27ca"
+    },
+    "deno": {
+      "source": "denoland/skills",
+      "sourceType": "github",
+      "skillPath": "skills/deno/SKILL.md",
+      "computedHash": "ac6e73271ee74ee92ee995bcd99661da6d8ad5280d90aee637b53267f6d3fbb7"
+    },
+    "deno-frontend": {
+      "source": "denoland/skills",
+      "sourceType": "github",
+      "skillPath": "skills/deno-frontend/SKILL.md",
+      "computedHash": "8cbd751af41a0cd988e9220eb93a36a4e1f254c193932ce3534da0fa608abd17"
+    }
+  }
+}
