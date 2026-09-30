@@ -3,7 +3,9 @@
   "tasks": {
     "check": "deno fmt --check . && deno lint . && deno check",
     "dev": "vite",
+    "dev:desktop": "deno desktop --hmr --inspect .",
     "build": "vite build",
+    "build:desktop": "deno desktop .",
     "start": "deno serve -A _fresh/server.js",
     "update": "deno run -A -r jsr:@fresh/update ."
   },
@@ -58,5 +60,16 @@
     "types": [
       "vite/client"
     ]
+  },
+  "desktop": {
+    "app": {
+      "name": "天翼云电脑续命工具",
+      "identifier": "com.4x25.CTYunPCKeepAlive",
+      "icons": {
+        "macos": "./static/app.icns",
+        "windows": "./static/app.ico",
+        "linux": "./static/app.png"
+      }
+    }
   }
 }
