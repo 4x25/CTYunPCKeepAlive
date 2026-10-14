@@ -11,7 +11,7 @@
     ],
     "types": [
       "vite/client",
-      "@cloudflare/workers-types"
+      "node"
     ],
     "jsx": "react-jsx",
     "jsxImportSource": "hono/jsx"

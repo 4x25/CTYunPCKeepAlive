@@ -3,7 +3,6 @@ dist/
 
 # dev
 .hono/
-.wrangler/
 .yarn/
 !.yarn/releases
 .vscode/*
@@ -15,11 +14,11 @@ dist/
 
 # deps
 node_modules/
+package-lock.json
 
 # env
 .env
 .env.production
-.dev.vars
 
 # logs
 logs/
