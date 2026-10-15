@@ -16,6 +16,7 @@
     "@hono/vite-dev-server": "^0.26.1",
     "@tailwindcss/vite": "^4.3.2",
     "@types/node": "^26.6.5",
+    "daisyui": "^5.7.50",
     "tailwindcss": "^4.3.2",
     "vite": "^8.1.4"
   }
