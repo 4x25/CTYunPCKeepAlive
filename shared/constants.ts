@@ -16,6 +16,22 @@ export const DEFAULT_POINTS_WINDOW = { winStart: '09:00', winEnd: '11:30' } as c
 /** 时长型任务（totalProgress 单位为秒；映射表由前端维护，api.md §2.4） */
 export const TASK_DURATION_IDS = [1003, 1105, 1106] as const
 
+/**
+ * 工具可代为执行的任务：只有「与AI对话1次」类（1004/1102）能通过 eaichat
+ * 发一轮对话完成；其余任务需要真实桌面会话或官方渠道人工操作（backend-design §4.2）。
+ */
+export const TASK_EXECUTABLE_IDS = [1004, 1102] as const
+
+/** 不可自动执行任务的固定提示（前后端共用，不含任务 ID） */
+export const TASK_UNSUPPORTED_REASON: Record<number, string> = {
+  1002: '需真实连接云电脑后自动完成，工具不代为连接',
+  1003: '需保持云电脑在线累计时长，本期不自动执行',
+  1101: '需在官方渠道绑定手机号',
+  1104: '需连续登录，工具不代为执行',
+  1105: '需保持云电脑在线累计时长，本期不自动执行',
+  1106: '需保持云电脑在线累计时长，本期不自动执行',
+}
+
 /** 「使用1小时」类任务本期不实现自动执行，link 恒为 null（backend-design §4.2） */
 export const LINK_TOTAL_SECONDS = 3600
 

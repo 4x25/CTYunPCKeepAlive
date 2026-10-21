@@ -84,6 +84,69 @@ interface RawPageDesktop {
   preemptionDesktopList?: RawDesktop[]
 }
 
+/** 积分概览原始行（docs/research/points-tasks.md §2.1） */
+interface RawPointRow {
+  pointType?: number | string
+  pointTypeName?: string
+  points?: number | string
+  pretakePoints?: number | string
+  willOutDate?: number | string | null
+  outDateTime?: number | string | null
+}
+
+interface RawTaskReward {
+  type?: number | string
+  typeDesc?: string
+  value?: number | string
+}
+
+/** 积分任务原始行（docs/research/points-tasks.md §2.2） */
+interface RawPointTask {
+  taskDefId?: number | string
+  taskDefName?: string
+  taskCalendarType?: number | string
+  points?: string | null
+  pointsList?: RawTaskReward[] | null
+  currentProgress?: number | string | null
+  totalProgress?: number | string | null
+  status?: number | string | null
+  isDisplayProgress?: boolean | null
+}
+
+/** 积分类型名（仅用于 pointsList 缺失时从 points JSON 兜底补文案） */
+const POINT_TYPE_NAMES: Record<number, string> = {
+  1: '通用积分',
+  10: '专属积分',
+  20: '九江专属积分',
+  500: '云智手机通用积分',
+}
+
+/** 积分概览行（已过滤非数字字段；willOutDate 交给聚合层判断） */
+export interface CtyunPointRow {
+  pointType: number
+  pointTypeName: string
+  points: number
+  willOutDate: number | null
+}
+
+/** 积分任务（字段已归一化，busy/auto 由会话层补充） */
+export interface CtyunTaskReward {
+  type: number
+  typeDesc: string
+  value: number
+}
+
+export interface CtyunTask {
+  taskDefId: number
+  taskDefName: string
+  taskCalendarType: number
+  pointsList: CtyunTaskReward[]
+  currentProgress: number
+  totalProgress: number
+  status: number
+  isDisplayProgress: boolean | null
+}
+
 interface HttpResult {
   status: number
   json: Record<string, unknown> | null
@@ -153,6 +216,70 @@ function toDesktop(raw: RawDesktop): CtyunDesktop | null {
 
 function isHostFailure(error: unknown): boolean {
   return error instanceof UpstreamNetworkError || (error instanceof UpstreamError && error.code === 30020)
+}
+
+/** points 字段是 JSON 字符串 `{"1":100}`：pointsList 缺失时据此补奖励明细（research §2.2） */
+function rewardsFromPointsJson(raw: string | null | undefined): CtyunTaskReward[] {
+  if (!raw) return []
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (!isRecord(parsed)) return []
+    const out: CtyunTaskReward[] = []
+    for (const [key, value] of Object.entries(parsed)) {
+      const type = toNumber(key)
+      const amount = toNumber(value)
+      if (type == null || amount == null) continue
+      out.push({ type, typeDesc: POINT_TYPE_NAMES[type] ?? '积分', value: amount })
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
+/** 任务归一化：pointsList 优先，缺失时回退 points JSON（research §2.2） */
+export function mapPointTask(raw: RawPointTask): CtyunTask | null {
+  const taskDefId = toNumber(raw.taskDefId)
+  if (taskDefId == null) return null
+  const rewards: CtyunTaskReward[] = []
+  if (Array.isArray(raw.pointsList)) {
+    for (const item of raw.pointsList) {
+      const type = toNumber(item?.type)
+      const value = toNumber(item?.value)
+      if (type == null || value == null) continue
+      rewards.push({ type, typeDesc: String(item?.typeDesc ?? POINT_TYPE_NAMES[type] ?? '积分'), value })
+    }
+  }
+  if (!rewards.length) rewards.push(...rewardsFromPointsJson(raw.points))
+
+  const status = toNumber(raw.status) ?? 0
+  return {
+    taskDefId,
+    taskDefName: String(raw.taskDefName ?? `任务 ${taskDefId}`),
+    taskCalendarType: toNumber(raw.taskCalendarType) ?? 5,
+    pointsList: rewards,
+    currentProgress: toNumber(raw.currentProgress) ?? 0,
+    totalProgress: toNumber(raw.totalProgress) ?? 1,
+    status: status >= 0 && status <= 3 ? status : 0,
+    /* 实测恒为 null（不是 boolean）：只有明确 false 才视为不展示（api.md §2.4） */
+    isDisplayProgress: raw.isDisplayProgress === false ? false : raw.isDisplayProgress === true ? true : null,
+  }
+}
+
+/** 积分行归一化：过滤非数字 points，保留 willOutDate 供聚合层过滤 */
+export function mapPointRow(raw: RawPointRow): CtyunPointRow | null {
+  const pointType = toNumber(raw.pointType)
+  const points = toNumber(raw.points)
+  if (pointType == null || points == null) return null
+  const willOutRaw = raw.willOutDate
+  /* truthy 即视为「即将过期」：非空但非数字时按 1 处理，避免误留 */
+  const willOutDate = willOutRaw == null || willOutRaw === '' ? null : (toNumber(willOutRaw) ?? 1)
+  return {
+    pointType,
+    pointTypeName: String(raw.pointTypeName ?? POINT_TYPE_NAMES[pointType] ?? '积分'),
+    points,
+    willOutDate,
+  }
 }
 
 export class CtyunClient {
@@ -597,12 +724,20 @@ export class CtyunClient {
     return this.unwrap<T>(res)
   }
 
-  async getUserPoints(): Promise<unknown[]> {
-    return this.selforderGet<unknown[]>('/selforder/api/marketing/userPoints/getUserPoints')
+  async getUserPoints(): Promise<CtyunPointRow[]> {
+    const rows = await this.selforderGet<RawPointRow[]>(
+      '/selforder/api/marketing/userPoints/getUserPoints',
+    )
+    if (!Array.isArray(rows)) return []
+    return rows.map(mapPointRow).filter((row): row is CtyunPointRow => row != null)
   }
 
-  async getTaskList(): Promise<unknown[]> {
-    return this.selforderGet<unknown[]>('/selforder/api/marketing/userPoints/getTaskList')
+  async getTaskList(): Promise<CtyunTask[]> {
+    const rows = await this.selforderGet<RawPointTask[]>(
+      '/selforder/api/marketing/userPoints/getTaskList',
+    )
+    if (!Array.isArray(rows)) return []
+    return rows.map(mapPointTask).filter((task): task is CtyunTask => task != null)
   }
 
   async getUserInfo(): Promise<Record<string, unknown>> {

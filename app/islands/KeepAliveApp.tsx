@@ -744,6 +744,25 @@ export default function KeepAliveApp() {
     }
   }
 
+  /**
+   * 任务受理后的静默复查：不占用「刷新任务」的 busy，也不弹 Toast。
+   * 后端执行一轮约 10–20s（对话 3–5s + 5s/15s 两次复查），按节奏跟两次即可。
+   */
+  function schedulePointsFollowUp(userId: number) {
+    const tick = async () => {
+      if (!accountsRef.current.some((account) => account.userId === userId)) return
+      try {
+        const result = await api.getPoints(userId)
+        patchAccount(userId, (account) => ({ ...account, points: result.points, tasks: result.tasks }))
+        void fetchState(undefined, true)
+      } catch {
+        /* 复查失败不打扰用户：可视刷新/切页签还有兜底 */
+      }
+    }
+    setTimeout(() => void tick(), 10_000)
+    setTimeout(() => void tick(), 26_000)
+  }
+
   async function onRunTask(userId: number, taskDefId: number) {
     const key = taskKey(userId, taskDefId)
     /* 与任务自动开关共用 busyTask：同一 taskDefId 只允许一个在途写操作 */
@@ -752,16 +771,24 @@ export default function KeepAliveApp() {
     setBusyTask((prev) => ({ ...prev, [key]: true }))
     const hold = taskRunHold(userId, taskDefId)
     inFlightRef.current.add(hold)
+    let accepted = false
     try {
-      const accepted = await api.runTask(userId, taskDefId)
-      noteRevision(accepted.revision)
-      /* 异步受理：立即复查一次 4.10，后续状态交给可视刷新与日志 */
-      const result = await api.getPoints(userId)
-      patchAccount(userId, (account) => ({ ...account, points: result.points, tasks: result.tasks }))
+      const acceptedResult = await api.runTask(userId, taskDefId)
+      accepted = true
+      noteRevision(acceptedResult.revision)
+      /* 受理即成功：随后的 4.10 复查失败属于「状态还没回来」，不弹错误 Toast、不回滚，
+         只做一次静默的 4.1 校正；执行结果交给 10s/26s 跟进与可视刷新 */
+      try {
+        const result = await api.getPoints(userId)
+        patchAccount(userId, (account) => ({ ...account, points: result.points, tasks: result.tasks }))
+      } catch {
+        /* 静默：后续跟进与可视刷新兜底 */
+      }
       void fetchState(undefined, true)
     } catch (error) {
       handleError(error)
     } finally {
+      if (accepted) schedulePointsFollowUp(userId)
       inFlightRef.current.delete(hold)
       busyTaskRef.current.delete(key)
       setBusyTask((prev) => withoutKey(prev, key))

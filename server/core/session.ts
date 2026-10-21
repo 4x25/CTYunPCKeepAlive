@@ -15,14 +15,21 @@ import type {
   PointsSummary,
 } from '../../shared/types'
 import { maskOf, nowHm } from '../../shared/utils'
-import { CtyunClient, type CtyunDesktop, type CtyunLoginProfile } from '../upstream/ctyun-client'
+import {
+  CtyunClient,
+  type CtyunDesktop,
+  type CtyunLoginProfile,
+  type CtyunPointRow,
+  type CtyunTask,
+} from '../upstream/ctyun-client'
 import {
   EaiChatClient,
   JWT_RENEW_THRESHOLD_MS,
   type EaiChatUserInfo,
 } from '../upstream/eaichat-client'
-import { classifyLoginFailure, upstreamMessage } from '../upstream/errors'
+import { UpstreamError, classifyLoginFailure, manualVerifyLabel, upstreamMessage } from '../upstream/errors'
 import type { PersistedAccount } from '../store/config'
+import { aggregatePoints, toPointTask } from './points'
 
 const EAI_RENEW_CHECK_MS = 12 * 60 * 60 * 1000
 /** 登录链路整体预算：negotiate + login + eaichat 共享（backend-design §2.1） */
@@ -57,6 +64,13 @@ function emptyPoints(): PointsSummary {
   return { pointsList: [], updatedDate: 0 }
 }
 
+/** 一次积分+任务刷新结果（4.10 响应与任务编排共用） */
+export interface PointsSnapshot {
+  points: PointsSummary
+  tasks: PointTask[]
+  updatedDate: number
+}
+
 export class AccountSession {
   private readonly deps: SessionDeps
   private readonly configUserId: number
@@ -70,6 +84,8 @@ export class AccountSession {
   private banner: Banner | null = null
   private eaichatOk = false
   private eaichatMsg: string | null = '尚未登录云智助手'
+  /** eaichat 不可用是否出自「需人工验证」；非空时不静默重登 */
+  private eaichatManual: string | null = null
   private desktops: CtyunDesktop[] = []
   private desktopAuto = new Map<string, boolean>()
   /** 最近一次保活（成功/失败都更新；不持久化，重启后回到「从未执行」） */
@@ -79,6 +95,12 @@ export class AccountSession {
   private taskAuto = new Map<number, boolean>()
   private tasks: PointTask[] = []
   private points: PointsSummary = emptyPoints()
+  /** 积分+任务刷新单飞：4.10 与任务编排并发时共用同一次上游请求 */
+  private pointsRefresh: Promise<PointsSnapshot> | null = null
+  /** 只拉任务列表的单飞（任务编排复查用） */
+  private tasksRefresh: Promise<PointTask[]> | null = null
+  /** 任务执行中（手动 4.11 / 自动编排共用）：同 taskDefId 天然互斥 */
+  private runningTasks = new Set<number>()
   private ctyun: CtyunClient | null = null
   private eai: EaiChatClient | null = null
   private profile: CtyunLoginProfile | null = null
@@ -153,6 +175,14 @@ export class AccountSession {
 
   get isEaichatReady(): boolean {
     return this.eaichatOk
+  }
+
+  /**
+   * 云智助手会话因「需人工验证」（图形/短信验证码、设备绑定）不可用时的验证类型文案；
+   * 非人工类失败返回 null。任务编排据此放弃自动轮次，绝不静默重登。
+   */
+  get eaichatManualLabel(): string | null {
+    return this.eaichatManual
   }
 
   /** 保活执行需要直接拿 eaichat client；未就绪返回 null（4.8 → 10008） */
@@ -248,6 +278,7 @@ export class AccountSession {
     this.banner = null
     this.eaichatOk = false
     this.eaichatMsg = null
+    this.eaichatManual = null
     this.touch()
   }
 
@@ -281,6 +312,7 @@ export class AccountSession {
     if (stale && stale !== client) void stale.logout()
     this.eaichatOk = true
     this.eaichatMsg = null
+    this.eaichatManual = null
     this.startEaichatRenewal()
     this.touch()
   }
@@ -291,6 +323,7 @@ export class AccountSession {
     const reason = upstreamMessage(Number.isFinite(code) ? code : -1)
     this.eaichatOk = false
     this.eaichatMsg = `云智助手会话获取失败：${reason}，无感保活暂不可用`
+    this.eaichatManual = manualVerifyLabel(Number.isFinite(code) ? code : -1)
     this.stopEaichatRenewal()
     const stale = this.eai
     this.eai = null
@@ -331,8 +364,10 @@ export class AccountSession {
     this.banner = banner
     this.eaichatOk = false
     this.eaichatMsg = '云电脑侧未登录，云智助手会话不可用'
+    this.eaichatManual = null
     this.desktops = []
     this.tasks = []
+    this.runningTasks.clear()
     this.points = emptyPoints()
     /* 登录失败：该账号的自动保活计划与过渡态追踪一并取消 */
     this.deps.disposed()
@@ -356,6 +391,127 @@ export class AccountSession {
   beginRelogin(): void {
     this.dot = 'load'
     this.banner = null
+    this.touch()
+  }
+
+  /* ── 积分 / 任务（backend-design §4） ─────────────────────── */
+
+  /**
+   * 积分 + 任务刷新（4.10 用）：同一账号同一时刻只发一次上游请求。
+   * 先拉任务再拉积分（两者都是明文 GET，串行避免瞬时并发）；
+   * 拉取失败原样抛出，由调用方决定错误信封（4.10）或顺延（自动编排）。
+   */
+  refreshPoints(): Promise<PointsSnapshot> {
+    if (this.pointsRefresh) return this.pointsRefresh
+    const run = this.doRefreshPoints().finally(() => {
+      if (this.pointsRefresh === run) this.pointsRefresh = null
+    })
+    this.pointsRefresh = run
+    return run
+  }
+
+  private async doRefreshPoints(): Promise<PointsSnapshot> {
+    /* 复用任务列表的单飞：4.10 与编排复查并发时只打一次 getTaskList */
+    await this.refreshTasks()
+    const rows: CtyunPointRow[] = await this.requireCtyun().getUserPoints()
+    this.points = aggregatePoints(rows)
+    this.touch()
+    return this.pointsSnapshot()
+  }
+
+  /**
+   * 只拉任务列表（任务编排的「复查」）：任务状态才是执行依据，
+   * 不因积分概览接口抖动而误判复查失败。同一账号同一时刻只发一次请求。
+   */
+  refreshTasks(): Promise<PointTask[]> {
+    if (this.tasksRefresh) return this.tasksRefresh
+    const run = this.doRefreshTasks().finally(() => {
+      if (this.tasksRefresh === run) this.tasksRefresh = null
+    })
+    this.tasksRefresh = run
+    return run
+  }
+
+  private async doRefreshTasks(): Promise<PointTask[]> {
+    const client = this.requireCtyun()
+    const tasks = await client.getTaskList()
+    this.applyTaskList(tasks)
+    this.touch()
+    return this.pointsSnapshot().tasks
+  }
+
+  private requireCtyun(): CtyunClient {
+    if (!this.ctyun) throw new UpstreamError(40010, '云电脑侧未登录')
+    return this.ctyun
+  }
+
+  /** 任务列表合并：保留本地 auto 开关；缺失任务（已下线）保留开关但不再展示 */
+  applyTaskList(list: readonly CtyunTask[]): void {
+    this.tasks = list.map((task) => toPointTask(task, { auto: false, busy: false }))
+    this.syncTaskFlags()
+  }
+
+  /** 按 runningTasks / taskAuto 重算下发给前端的 busy/auto */
+  private syncTaskFlags(): void {
+    this.tasks = this.tasks.map((task) => ({
+      ...task,
+      auto: this.taskAuto.get(task.taskDefId) ?? false,
+      busy: this.runningTasks.has(task.taskDefId),
+    }))
+  }
+
+  /** 当前积分+任务快照（不触发上游） */
+  pointsSnapshot(): PointsSnapshot {
+    return {
+      points: {
+        ...this.points,
+        pointsList: this.points.pointsList.map((item) => ({ ...item })),
+      },
+      tasks: this.tasks.map((task) => ({
+        ...task,
+        pointsList: task.pointsList.map((item) => ({ ...item })),
+      })),
+      updatedDate: this.points.updatedDate,
+    }
+  }
+
+  findTask(taskDefId: number): PointTask | undefined {
+    return this.tasks.find((task) => task.taskDefId === taskDefId)
+  }
+
+  isTaskAuto(taskDefId: number): boolean {
+    return this.taskAuto.get(taskDefId) ?? false
+  }
+
+  setTaskAuto(taskDefId: number, auto: boolean): void {
+    this.taskAuto.set(taskDefId, auto)
+    this.syncTaskFlags()
+    this.touch()
+  }
+
+  /** 当前 auto=true 的任务定义 ID（不依赖任务表是否已拉到，计划排程用它判断） */
+  get autoTaskDefIds(): number[] {
+    const out: number[] = []
+    for (const [taskDefId, auto] of this.taskAuto) if (auto) out.push(taskDefId)
+    return out
+  }
+
+  /** 手动/自动执行互斥：同一 taskDefId 同时只允许一个在途执行 */
+  isTaskRunning(taskDefId: number): boolean {
+    return this.runningTasks.has(taskDefId)
+  }
+
+  beginTaskRun(taskDefId: number): boolean {
+    if (this.runningTasks.has(taskDefId)) return false
+    this.runningTasks.add(taskDefId)
+    this.syncTaskFlags()
+    this.touch()
+    return true
+  }
+
+  endTaskRun(taskDefId: number): void {
+    this.runningTasks.delete(taskDefId)
+    this.syncTaskFlags()
     this.touch()
   }
 
@@ -413,8 +569,10 @@ export class AccountSession {
   }
 
   /**
-   * 修正凭据：保活间隔、积分时间窗口、实例/任务 auto 按位置继承。
-   * 新账号列表为空时保留旧开关映射（按 desktopId），避免登录后列表拉取失败丢配置。
+   * 修正凭据：保活间隔、积分时间窗口、实例/任务 auto 继承。
+   * - 实例 auto 按位置继承（api.md 口径：实例按登录后的列表顺序对齐）
+   * - 任务 auto 优先按 taskDefId 继承（上游任务表顺序可能变化），旧表没有该任务时才回退位置
+   * 新账号列表为空时保留旧开关映射（按 desktopId / taskDefId），避免登录后列表拉取失败丢配置。
    */
   inheritSettingsFrom(previous: AccountSession): void {
     this.interval = previous.interval
@@ -441,11 +599,17 @@ export class AccountSession {
     if (this.tasks.length) {
       this.taskAuto.clear()
       if (previous.tasks.length) {
+        const oldIds = new Set(previous.tasks.map((task) => task.taskDefId))
         this.tasks.forEach((task, index) => {
+          if (oldIds.has(task.taskDefId)) {
+            if (previous.taskAuto.get(task.taskDefId)) this.taskAuto.set(task.taskDefId, true)
+            return
+          }
           const old = previous.tasks[index]
           if (old && previous.taskAuto.get(old.taskDefId)) this.taskAuto.set(task.taskDefId, true)
         })
       } else if (previous.taskAuto.size) {
+        /* 旧账号从未成功拉到任务表：按配置文件中的顺序尽力恢复 */
         const flags = [...previous.taskAuto.values()]
         this.tasks.forEach((task, index) => {
           if (flags[index]) this.taskAuto.set(task.taskDefId, true)
@@ -547,7 +711,6 @@ export class AccountSession {
       tasks: this.tasks.map((task) => ({
         ...task,
         pointsList: task.pointsList.map((item) => ({ ...item })),
-        auto: this.taskAuto.get(task.taskDefId) ?? false,
       })),
     }
   }
@@ -583,6 +746,9 @@ export class AccountSession {
     this.profile = null
     this.eaichatOk = false
     this.desktopRefresh = null
+    this.pointsRefresh = null
+    this.tasksRefresh = null
+    this.runningTasks.clear()
     void ctyun?.logout()
     void eai?.logout()
     this.deps.disposed()

@@ -68,6 +68,14 @@ const MESSAGES: Record<number, string> = {
   52070: '该云电脑已有操作在执行',
 }
 
+/**
+ * 该 code 是否需要用户本人在官方客户端完成（图形/短信验证码、设备绑定）。
+ * 这类失败一律不再静默重登（backend-design §2.3）。
+ */
+export function manualVerifyLabel(code: number): string | null {
+  return MANUAL_LABELS[code] ?? null
+}
+
 /** 上游 code / 网络错误 → 固定可展示文案（绝不回显上游原文，避免带出账号等敏感值） */
 export function upstreamMessage(code: number): string {
   if (code === -1) return '上游网络异常或超时'
@@ -78,7 +86,7 @@ export function upstreamMessage(code: number): string {
 export function classifyLoginFailure(error: unknown): LoginFailureInfo {
   const code = error instanceof UpstreamError ? error.code : -1
   const message = upstreamMessage(code)
-  const manualLabel = MANUAL_LABELS[code] ?? null
+  const manualLabel = manualVerifyLabel(code)
   if (manualLabel) {
     return { code, tone: 'warn', action: 'retry', manualLabel, message }
   }

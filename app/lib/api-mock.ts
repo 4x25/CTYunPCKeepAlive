@@ -15,6 +15,8 @@ import {
   MAX_ACCOUNTS,
   MAX_INTERVAL_MINUTES,
   MIN_INTERVAL_MINUTES,
+  TASK_EXECUTABLE_IDS,
+  TASK_UNSUPPORTED_REASON,
 } from '../../shared/constants'
 import type {
   Account,
@@ -104,8 +106,12 @@ function expireIn(days: number): number {
 /* ── 种子数据 ─────────────────────────────────────────────── */
 
 function seedPoints(updatedAt = atTime('09:41:22')): PointsSummary {
+  /* 与真实账号一致：主数字只取 pointType=1，云智手机通用积分(500) 仅明细展示 */
   return {
-    pointsList: [{ pointType: 1, pointTypeName: '通用积分', points: 1280 }],
+    pointsList: [
+      { pointType: 1, pointTypeName: '通用积分', points: 1280 },
+      { pointType: 500, pointTypeName: '云智手机通用积分', points: 230 },
+    ],
     updatedDate: updatedAt,
   }
 }
@@ -115,18 +121,20 @@ function emptyPoints(): PointsSummary {
 }
 
 function seedTasks(): PointTask[] {
+  /* isDisplayProgress 实测恒为 null（不是 boolean）：只有明确 false 才隐藏进度 */
   return [
     {
       taskDefId: 1002,
       taskDefName: '登录AI云电脑',
       taskCalendarType: 5,
       pointsList: [{ type: 1, typeDesc: '通用积分', value: 100 }],
-      currentProgress: 1,
+      currentProgress: 0,
       totalProgress: 1,
-      status: 2,
-      isDisplayProgress: true,
+      status: 0,
+      isDisplayProgress: null,
       busy: false,
-      auto: true,
+      /* 需真实连接云电脑才能完成，工具不代为执行 */
+      auto: false,
     },
     {
       taskDefId: 1003,
@@ -135,10 +143,10 @@ function seedTasks(): PointTask[] {
       pointsList: [{ type: 1, typeDesc: '通用积分', value: 100 }],
       currentProgress: 1452,
       totalProgress: 3600,
-      status: 1,
-      isDisplayProgress: true,
+      status: 0,
+      isDisplayProgress: null,
       busy: false,
-      /* 时长类任务本期不自动执行（backend-design §4.2），需要手动点「执行」 */
+      /* 时长类任务需会话在线累计，本期不自动执行（backend-design §4.2） */
       auto: false,
     },
     {
@@ -149,7 +157,7 @@ function seedTasks(): PointTask[] {
       currentProgress: 0,
       totalProgress: 1,
       status: 0,
-      isDisplayProgress: true,
+      isDisplayProgress: null,
       busy: false,
       auto: true,
     },
@@ -555,6 +563,15 @@ function validateCredentials(body: CredentialsBody): void {
   if (!body.password) throw new ApiError(ErrorCode.InvalidParam, '请填写密码')
 }
 
+/* ── 可代为执行的任务（与真实后端 shared/constants 同口径） ── */
+function isMockExecutable(taskDefId: number): boolean {
+  return (TASK_EXECUTABLE_IDS as readonly number[]).includes(taskDefId)
+}
+
+function mockUnsupportedReason(taskDefId: number): string {
+  return TASK_UNSUPPORTED_REASON[taskDefId] ?? '该类任务需在官方客户端完成，工具不代为执行'
+}
+
 /* ── userId 演示表：真实实现只认登录响应，绝不本地推算 ───── */
 const UID_BOOK: Record<string, number> = {
   '13800006021': 41288301,
@@ -921,18 +938,30 @@ export const mockApi: ApiClient = {
     /* banner 判定先于资源查找 */
     if (account.banner) throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法执行任务')
     const task = findTask(account, taskDefId)
+    /* 与真实后端一致：只有「与AI对话」类可代为执行，其余返回 10005 */
+    if (!isMockExecutable(taskDefId)) {
+      throw new ApiError(ErrorCode.StateNotAllowed, `该任务无法由工具代为执行：${mockUnsupportedReason(taskDefId)}`)
+    }
     if (task.status === 2) throw new ApiError(ErrorCode.StateNotAllowed, '该任务今日已完成，不再重复执行')
-    if (task.busy) throw new ApiError(ErrorCode.StateNotAllowed, '该任务正在执行中')
+    if (task.status === 1) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '该任务已完成，积分正在发放，无需重复执行')
+    }
+    if (task.status === 3) throw new ApiError(ErrorCode.StateNotAllowed, '该任务已失效，无需执行')
+    /* 拒绝顺序与真实后端一致：状态 → 在途 → 云智助手会话（在途优先于 10008） */
+    if (task.busy) throw new ApiError(ErrorCode.StateNotAllowed, '该任务正在执行中，请稍候')
+    /* 与真实后端同口径：云智助手会话不可用时 10008（「助手异常号」演示这个分支） */
+    if (!account.eaichat.ok) {
+      throw new ApiError(ErrorCode.EaichatUnavailable, account.eaichat.msg ?? '云智助手会话不可用，无感保活暂不可用')
+    }
     task.busy = true
-    task.status = 1
     state.revision += 1
+    appendLog(userId, 'INFO', '积分', `${task.taskDefName} 已受理，开始执行`)
 
-    /* 异步受理：响应即返回，任务状态经后续 getPoints / 日志回显 */
+    /* 异步受理：响应即返回；执行约 1.5s + 复查 5s，状态经后续 getPoints / 日志回显 */
     setTimeout(() => {
       const current = state.accounts.find((a) => a.userId === userId)
       const currentTask = current?.tasks.find((t) => t.taskDefId === taskDefId)
-      if (!current) return
-      if (!currentTask) return
+      if (!current || !currentTask) return
       currentTask.busy = false
       currentTask.status = 2
       /* 完成态同步进度与积分合计，UI 观察项 */
@@ -948,19 +977,31 @@ export const mockApi: ApiClient = {
         userId,
         'INFO',
         '积分',
-        `「${currentTask.taskDefName}」手动执行完成 · 本次奖励 ${reward} 通用积分 · 该任务今日不再自动执行`,
+        `${currentTask.taskDefName} 执行成功 · 已到账 ${reward} 通用积分（同一天重复对话不重复加分）`,
       )
-    }, 1200)
+    }, 4000)
 
     return { revision: state.revision, taskDefId, busy: true } satisfies RunTaskResult
   },
 
   async setTaskAuto(userId, taskDefId, auto) {
     const account = findAccount(userId)
-    const task = findTask(account, taskDefId)
+    const task = account.tasks.find((item) => item.taskDefId === taskDefId)
+
+    /* 关闭永远允许：任务已不在列表（banner 清空/已下线）时也算清理偏好成功 */
+    if (!task && !auto) return { revision: state.revision, taskDefId, auto: false } satisfies SetTaskAutoResult
+    if (!task) throw new ApiError(ErrorCode.TaskNotFound, '任务不存在，请刷新后重试')
+
+    /* 打开才受账号状态与在途执行限制：banner 期间关闭同样允许（与真实后端同口径） */
+    if (auto && account.banner) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法修改任务自动开关')
+    }
+    if (auto && task.busy) throw new ApiError(ErrorCode.StateNotAllowed, '该任务正在执行中，请稍后再切换自动开关')
+
     await sleep(latency(80, 80))
     task.auto = auto
     state.revision += 1
+    appendLog(userId, 'INFO', '积分', `${task.taskDefName} 已${auto ? '开启' : '关闭'}自动执行`)
     return { revision: state.revision, taskDefId, auto } satisfies SetTaskAutoResult
   },
 

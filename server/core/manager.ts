@@ -23,9 +23,12 @@ import type {
   KeepaliveResult,
   PatchSettingsBody,
   PatchSettingsResult,
+  PointsResult,
   ReloginResult,
+  RunTaskResult,
   RunState,
   SetDesktopAutoResult,
+  SetTaskAutoResult,
   StateSnapshot,
   UpdateCredentialsResult,
 } from '../../shared/types'
@@ -36,7 +39,9 @@ import { CONFIG_DIR, loadConfig, saveConfig } from '../store/config'
 import { appendLog, clearAccountLogs, ensureLogDir } from '../store/logs'
 import { UpstreamError, upstreamMessage } from '../upstream/errors'
 import { AccountSession, LOGIN_BUDGET_MS, RevisionCounter } from './session'
+import { isExecutableTask } from './points'
 import { scheduler } from './scheduler'
+import { taskRunner } from './task-runner'
 import type { KeepaliveOutcome } from './keepalive'
 
 function sessionApiMessage(code: number): string {
@@ -54,7 +59,7 @@ function sessionApiMessage(code: number): string {
     case 51091:
       return '需要短信验证码，请在官方客户端完成验证后重试'
     case 30060:
-      return '该账号需要先完成设备绑定'
+      return '该账号需要先在官方客户端完成设备绑定'
     default:
       return upstreamMessage(code)
   }
@@ -153,6 +158,18 @@ export class AccountManager {
           )
         }
 
+        try {
+          await session.refreshPoints()
+        } catch (error) {
+          const code = errorCode(error)
+          this.logAccount(
+            session,
+            'WARN',
+            '账号',
+            `${label} 积分与任务获取失败：${upstreamMessage(code)}（code=${code}），可稍后手动刷新`,
+          )
+        }
+
         /* 登录期间用户可能已删除/顶替该账号：放弃并关闭这个孤儿会话 */
         if (!this.sessions.includes(session)) {
           session.dispose()
@@ -161,6 +178,8 @@ export class AccountManager {
         session.finalizeLogin()
         autoPlans += session.autoDesktopCount
         this.dedupeSessions(session, label)
+        scheduler.syncSession(session)
+        taskRunner.syncSession(session)
         const pcCount = session.toAccount().pcs.length
         this.logAccount(
           session,
@@ -300,6 +319,7 @@ export class AccountManager {
     for (const oldUserId of replacedIds) clearAccountLogs(oldUserId)
     /* 新账号的自动开关全部默认关闭；确保没有同 userId 的残留计划 */
     scheduler.syncSession(session)
+    taskRunner.syncSession(session)
     if (replaced) {
       this.logSystem(
         'INFO',
@@ -381,6 +401,7 @@ export class AccountManager {
     draft.finalizeLogin()
     /* 继承的 auto 开关要立刻生效（登录时的列表拉取发生在继承之前） */
     scheduler.syncSession(draft)
+    taskRunner.syncSession(draft)
 
     const displaced = this.sessions.filter((item) => item !== previous && item.userId === draft.userId)
     const sameUserId = draft.userId === previous.userId
@@ -394,6 +415,7 @@ export class AccountManager {
       /* 落盘失败：新会话作废，旧会话的计划按原状态恢复（syncSession 已先清过旧计划） */
       draft.dispose()
       scheduler.syncSession(previous)
+      taskRunner.syncSession(previous)
       throw error
     }
 
@@ -458,6 +480,7 @@ export class AccountManager {
       session.finalizeLogin()
       /* banner 期间被取消的计划在重新登录成功后恢复（列表拉取早于 finalize） */
       scheduler.syncSession(session)
+      taskRunner.syncSession(session)
       const suffix = warnings.length
         ? warnings.every((warning) => warning.includes('云智助手'))
           ? ' · 云智助手会话不可用，无感保活暂不可用'
@@ -566,6 +589,7 @@ export class AccountManager {
       )
     }
     if (hasWindow) {
+      taskRunner.applyWindow(session)
       this.logAccount(
         session,
         'INFO',
@@ -726,6 +750,89 @@ export class AccountManager {
     }
   }
 
+  /* ── 4.10 刷新积分与任务 ────────────────────────────────── */
+
+  async listPoints(userId: number): Promise<PointsResult> {
+    await this.ready()
+    const session = this.requireSession(userId)
+    if (session.hasBanner) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法获取积分与任务')
+    }
+    try {
+      const snapshot = await session.refreshPoints()
+      return { points: snapshot.points, tasks: snapshot.tasks, updatedDate: snapshot.updatedDate }
+    } catch (error) {
+      throw this.toApiError(error)
+    }
+  }
+
+  /* ── 4.11 手动执行任务（异步受理） ──────────────────────── */
+
+  async runTask(userId: number, taskDefId: number): Promise<RunTaskResult> {
+    await this.ready()
+    const session = this.requireSession(userId)
+    /* 受理后立即返回：busy 由快照体现，执行结果经 4.10 复查与日志回显 */
+    taskRunner.acceptManual(session, taskDefId)
+    return { revision: this.revision.value, taskDefId, busy: true }
+  }
+
+  /* ── 4.12 切换任务自动开关 ──────────────────────────────── */
+
+  async setTaskAuto(userId: number, taskDefId: number, auto: boolean): Promise<SetTaskAutoResult> {
+    await this.ready()
+    const session = this.requireSession(userId)
+    const task = session.findTask(taskDefId)
+
+    /* 关闭永远允许：任务已不在当前列表（banner 清空/已下线）时也允许清掉持久化开关 */
+    if (!task && !auto) {
+      if (!session.isTaskAuto(taskDefId)) return { revision: this.revision.value, taskDefId, auto: false }
+      session.setTaskAuto(taskDefId, false)
+      try {
+        await this.persistSessions(this.sessions)
+      } catch (error) {
+        session.setTaskAuto(taskDefId, true)
+        throw error
+      }
+      taskRunner.syncSession(session)
+      return { revision: this.revision.value, taskDefId, auto: false }
+    }
+    if (!task) throw new ApiError(ErrorCode.TaskNotFound, ERROR_MESSAGES[ErrorCode.TaskNotFound])
+
+    /* 打开受账号状态与在途执行限制 */
+    if (auto && session.hasBanner) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法修改任务自动开关')
+    }
+    if (auto && session.isTaskRunning(taskDefId)) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '该任务正在执行中，请稍后再切换自动开关')
+    }
+
+    const wasAuto = session.isTaskAuto(taskDefId)
+    session.setTaskAuto(taskDefId, auto)
+    try {
+      await this.persistSessions(this.sessions)
+    } catch (error) {
+      session.setTaskAuto(taskDefId, wasAuto)
+      throw error
+    }
+
+    taskRunner.syncSession(session)
+    if (wasAuto !== auto) {
+      /* 不可代为执行的任务只记录偏好：明确写出「不会自动起跑」，避免用户误以为已接管 */
+      const note = auto
+        ? isExecutableTask(taskDefId)
+          ? ''
+          : '（仅记录偏好，不会自动起跑；该类任务需到官方客户端完成）'
+        : '（该任务不再自动起跑）'
+      this.logAccount(
+        session,
+        'INFO',
+        '积分',
+        `${task.taskDefName} 已${auto ? '开启' : '关闭'}自动执行${note}`,
+      )
+    }
+    return { revision: this.revision.value, taskDefId, auto }
+  }
+
   /* ── 登录编排 / 持久化 / 错误映射 ────────────────────────── */
 
   /**
@@ -750,6 +857,13 @@ export class AccountManager {
       warnings.push(`云电脑列表获取失败：${upstreamMessage(code)}，可稍后重试登录恢复`)
     }
 
+    try {
+      await session.refreshPoints()
+    } catch (error) {
+      const code = errorCode(error)
+      warnings.push(`积分与任务获取失败：${upstreamMessage(code)}，可稍后手动刷新`)
+    }
+
     session.finalizeLogin()
     return warnings
   }
@@ -766,7 +880,10 @@ export class AccountManager {
       /* 列表刷新后对齐计划（run 变化即时反作用于计划、恢复计时） */
       desktopsUpdated: () => scheduler.syncSession(session),
       /* 删除/替换/登录失败：清掉该会话全部定时器与追踪任务 */
-      disposed: () => scheduler.dropSession(session),
+      disposed: () => {
+        scheduler.dropSession(session)
+        taskRunner.dropSession(session)
+      },
       /* left 实时派生：nextFireAt - now() */
       planLeft: (desktopId: string) => scheduler.leftFor(session.userId, desktopId),
     }

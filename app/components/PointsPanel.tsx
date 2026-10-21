@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'hono/jsx'
 import type { Account, PointTask } from '../lib/types'
 import {
+  isExecutableTask,
   pointsDetail,
   pointsText,
   pointsTotal,
@@ -9,6 +10,8 @@ import {
   taskProgressRatio,
   taskProgressText,
   taskStatusBadge,
+  taskUnsupportedReason,
+  tasksEmptyText,
   todayDone,
 } from '../lib/derive'
 import { formatHm } from '../../shared/utils'
@@ -81,7 +84,7 @@ export default function PointsPanel(props: Props) {
           />
           <HelpMark
             label="执行时间说明"
-            tip="每天在这个窗口内随机取一个起跑时刻，跑完一轮就结束；窗口只约束起跑时间。「使用1小时」等时长类任务本期不自动执行，需要手动点「执行」。"
+            tip="每天在这个窗口内随机取一个起跑时刻执行一轮；起跑前会先复查任务状态，只跑未完成且打开了自动开关的任务。工具只能代为执行「与AI对话」类任务；「登录AI云电脑」需真实连接云电脑，「使用1小时」需会话在线累计时长，这两类请到官方客户端完成。"
           />
         </div>
         <div class="flex items-center gap-2.5">
@@ -97,7 +100,7 @@ export default function PointsPanel(props: Props) {
 
       <div class="flex flex-wrap items-baseline gap-8 px-2 pb-3.5">
         <div>
-          <p class="font-mono text-xs text-base-content/60">当前积分（示例）</p>
+          <p class="font-mono text-xs text-base-content/60">当前积分</p>
           <div class="font-mono text-4xl font-semibold tabular-nums tracking-tight">{pointsText(points)}</div>
           {account.points.pointsList.length > 0 && (
             <p class="mt-1 font-mono text-[11px] text-base-content/50">{pointsDetail(account.points)}</p>
@@ -115,68 +118,104 @@ export default function PointsPanel(props: Props) {
       </div>
 
       <div class="min-h-0 flex-1 overflow-auto">
-        <table class="table table-sm table-pin-cols table-pin-rows whitespace-nowrap">
-          <thead>
-            <tr class="font-mono text-[11px] tracking-wider text-base-content/60">
-              {/* pin-cols 只对 tr th 生效：不固定的列表头用 td，否则会被一起吸到左缘堆叠 */}
-              <td>任务</td>
-              <td>奖励</td>
-              <td>进度</td>
-              <td>状态</td>
-              <td class="w-20">执行</td>
-              <th class="w-14">自动</th>
-            </tr>
-          </thead>
-          <tbody>
-            {tasks.map((task) => {
-              const key = `${account.userId}:${task.taskDefId}`
-              const busy = task.busy || !!props.busyTask[key]
-              const disabled = task.status !== 0 || busy
-              const autoBusy = busy
-              return (
-                <tr key={task.taskDefId} class="row-hover">
-                  <td class="text-[13px] font-semibold">{task.taskDefName}</td>
-                  <td class="font-mono tabular-nums">+{rewardOf(task)}</td>
-                  <td class="min-w-28" title={task.isDisplayProgress === false ? '该任务不展示进度' : undefined}>
-                    <span class="block font-mono text-[11.5px] tabular-nums whitespace-nowrap text-base-content/60">
-                      {taskProgressText(task)}
-                    </span>
-                    <progress
-                      class="progress mt-1 h-[3px] w-full"
-                      value={Math.round(taskProgressRatio(task) * 100)}
-                      max="100"
-                    />
-                  </td>
-                  <td>
-                    <StatusBadge task={task} />
-                  </td>
-                  <td class="w-20">
-                    <button
-                      type="button"
-                      class="btn btn-xs"
-                      disabled={disabled}
-                      title={task.status === 2 ? taskDoneLabel(task) : undefined}
-                      onClick={() => props.onRunTask(task.taskDefId)}
-                    >
-                      {busy ? '执行中…' : task.status === 1 ? '执行中' : '执行'}
-                    </button>
-                  </td>
-                  <th class="w-14 font-normal">
-                    <input
-                      type="checkbox"
-                      class="toggle toggle-sm"
-                      checked={task.auto}
-                      disabled={autoBusy}
-                      title={autoBusy ? '该任务有操作正在进行…' : undefined}
-                      aria-label={`自动执行 ${task.taskDefName}`}
-                      onChange={(e: Event) => props.onToggleTask(task.taskDefId, (e.target as HTMLInputElement).checked)}
-                    />
-                  </th>
-                </tr>
-              )
-            })}
-          </tbody>
-        </table>
+        {!tasks.length ? (
+          <div class="grid h-full place-items-center text-[13px] text-base-content/60">{tasksEmptyText()}</div>
+        ) : (
+          <table class="table table-sm table-pin-cols table-pin-rows whitespace-nowrap">
+            <thead>
+              <tr class="font-mono text-[11px] tracking-wider text-base-content/60">
+                {/* pin-cols 只对 tr th 生效：不固定的列表头用 td，否则会被一起吸到左缘堆叠 */}
+                <td>任务</td>
+                <td>奖励</td>
+                <td>进度</td>
+                <td>状态</td>
+                <td class="w-20">执行</td>
+                <th class="w-14">自动</th>
+              </tr>
+            </thead>
+            <tbody>
+              {tasks.map((task) => {
+                const key = `${account.userId}:${task.taskDefId}`
+                const busy = task.busy || !!props.busyTask[key]
+                const executable = isExecutableTask(task.taskDefId)
+                const unsupported = taskUnsupportedReason(task.taskDefId)
+                const doneToday = task.status === 2
+                const runnable = executable && task.status === 0
+                const disabled = !runnable || busy
+                const tip = !executable
+                  ? unsupported ?? undefined
+                  : doneToday
+                    ? taskDoneLabel(task)
+                    : task.status === 1
+                      ? '任务已完成，积分正在发放，无需重复执行'
+                      : task.status === 3
+                        ? '任务已失效，无需执行'
+                        : busy
+                          ? '该任务正在执行中…'
+                          : undefined
+                /* 自动开关：4.12 对所有任务可切换并持久化；只有可代为执行的任务会真正起跑 */
+                const autoDisabled = busy
+                const autoTip = busy
+                  ? '该任务有操作正在进行…'
+                  : executable
+                    ? undefined
+                    : `${unsupported ?? '该类任务需在官方客户端完成'} · 开关仅记录偏好，不会自动起跑`
+                return (
+                  <tr key={task.taskDefId} class="row-hover">
+                    <td class="text-[13px] font-semibold">{task.taskDefName}</td>
+                    <td class="font-mono tabular-nums">+{rewardOf(task)}</td>
+                    <td class="min-w-28" title={task.isDisplayProgress === false ? '该任务不展示进度' : undefined}>
+                      <span class="block font-mono text-[11.5px] tabular-nums whitespace-nowrap text-base-content/60">
+                        {taskProgressText(task)}
+                      </span>
+                      {task.isDisplayProgress !== false && (
+                        <progress
+                          class="progress progress-success mt-1 h-[3px] w-full"
+                          value={Math.round(taskProgressRatio(task) * 100)}
+                          max="100"
+                        />
+                      )}
+                    </td>
+                    <td>
+                      <StatusBadge task={task} />
+                    </td>
+                    <td class="w-20">
+                      <button
+                        type="button"
+                        class="btn btn-xs"
+                        disabled={disabled}
+                        title={tip}
+                        onClick={() => props.onRunTask(task.taskDefId)}
+                      >
+                        {busy
+                          ? '执行中…'
+                          : doneToday
+                            ? '已完成'
+                            : task.status === 1
+                              ? '发放中'
+                              : task.status === 3
+                                ? '已失效'
+                                : executable
+                                  ? '执行'
+                                  : '不可代执行'}
+                      </button>
+                    </td>
+                    <th class="w-14 font-normal" title={autoTip}>
+                      <input
+                        type="checkbox"
+                        class="toggle toggle-sm"
+                        checked={task.auto}
+                        disabled={autoDisabled}
+                        aria-label={`自动执行 ${task.taskDefName}`}
+                        onChange={(e: Event) => props.onToggleTask(task.taskDefId, (e.target as HTMLInputElement).checked)}
+                      />
+                    </th>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   )

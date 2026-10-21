@@ -2,7 +2,7 @@
  * 纯展示派生（frontend-design §4.3）：组件只调不改，所有函数不依赖浏览器 API。
  */
 import dayjs from 'dayjs/esm'
-import { TASK_DURATION_IDS } from '../../shared/constants'
+import { TASK_DURATION_IDS, TASK_EXECUTABLE_IDS, TASK_UNSUPPORTED_REASON } from '../../shared/constants'
 import type { Account, PcInstance, PointTask, PointsSummary, TaskStatus } from '../../shared/types'
 import { formatHms, maskOf } from '../../shared/utils'
 
@@ -71,10 +71,26 @@ export function pcsEmptyText(account: Account): string {
   return '暂时无法获取云电脑列表'
 }
 
+/** 积分任务空态文案（与 pcsEmptyText 同口径；banner 期间不展示功能页签，这里只需正常态文案） */
+export function tasksEmptyText(): string {
+  return '暂时无法获取积分任务列表 · 点右上角「刷新任务」重试'
+}
+
 /* ── 积分任务 ─────────────────────────────────────────────── */
 
 export function isDurationTask(taskDefId: number): boolean {
   return (TASK_DURATION_IDS as readonly number[]).includes(taskDefId)
+}
+
+/** 工具可代为执行的任务（仅「与AI对话」类，backend-design §4.2） */
+export function isExecutableTask(taskDefId: number): boolean {
+  return (TASK_EXECUTABLE_IDS as readonly number[]).includes(taskDefId)
+}
+
+/** 不可执行任务的置灰原因；可执行任务返回 null */
+export function taskUnsupportedReason(taskDefId: number): string | null {
+  if (isExecutableTask(taskDefId)) return null
+  return TASK_UNSUPPORTED_REASON[taskDefId] ?? '该类任务需在官方客户端完成，工具不代为执行'
 }
 
 /** 进度文本：次数型 "1 / 1 次"；时长型 "24 / 60 分钟"；不展示进度时 "—" */

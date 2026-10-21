@@ -26,6 +26,9 @@ export const JWT_RENEW_THRESHOLD_MS = 6 * 24 * 60 * 60 * 1000
 /** 云智助手登录链路单请求超时 / 独立调用时的整体预算 */
 const EAI_LOGIN_CALL_TIMEOUT_MS = 7_000
 const EAI_LOGIN_BUDGET_MS = 28_000
+/** 一轮「与AI对话」的固定文案与超时（实测 3–5s 内任务到账；超时留足异常余量） */
+const CHAT_ONCE_MESSAGE = '你好，请只回复：收到'
+const CHAT_ONCE_TIMEOUT_MS = 30_000
 
 interface Cookie {
   name: string
@@ -144,6 +147,15 @@ export interface EaiChatResult {
   finishReason: string | null
   model: string | null
   events: JsonRecord[]
+}
+
+/** chatOnce 的判定结果（只回传判定所需字段，不落任何消息/密钥） */
+export interface EaiChatOnceResult {
+  ok: boolean
+  conversationId: string | null
+  finishReason: string | null
+  audit: string | null
+  elapsedMs: number
 }
 
 interface RequestOptions {
@@ -535,7 +547,13 @@ export class EaiChatClient {
   /** S4 用：单轮流式对话；本期保留完整实现，不做任务编排 */
   async chat(
     message: string,
-    options: { conversationId?: string; model?: string; webSearch?: boolean; thinking?: boolean } = {},
+    options: {
+      conversationId?: string
+      model?: string
+      webSearch?: boolean
+      thinking?: boolean
+      timeoutMs?: number
+    } = {},
   ): Promise<EaiChatResult> {
     if (!this.sk) throw new UpstreamError(40010, '云智助手未登录')
     if (!message.trim()) throw new UpstreamError(10004, '消息不能为空')
@@ -587,7 +605,7 @@ export class EaiChatClient {
       method: 'POST',
       headers,
       body,
-      timeoutMs: 120_000,
+      timeoutMs: options.timeoutMs ?? 120_000,
     })
     if (res.status === 401) {
       this.jar.clear()
@@ -633,6 +651,38 @@ export class EaiChatClient {
       if (json.status === 'fail') throw new UpstreamError(-1, '云智助手模型返回 status=fail')
     }
     return result
+  }
+
+  /**
+   * S4 任务执行器：发一轮固定对话并消费 SSE 至结束（backend-design §4.2）。
+   *
+   * 成功判定：`finish_reason === "stop"` 且 `audit_result !== "block"`
+   *（服务端不发 `[DONE]`，以 reader 结束 / finish_reason 为准）。
+   * 内容固定、关闭联网与思考，避免产生实际资源消耗或触发审计。
+   * 会话失效（401/40010）由调用方（task-runner）走 silentReloginEaichat 后重试一次。
+   */
+  async chatOnce(options: { message?: string; timeoutMs?: number } = {}): Promise<EaiChatOnceResult> {
+    const startedAt = Date.now()
+    try {
+      const result = await this.chat(options.message ?? CHAT_ONCE_MESSAGE, {
+        webSearch: false,
+        thinking: false,
+        timeoutMs: options.timeoutMs ?? CHAT_ONCE_TIMEOUT_MS,
+      })
+      const audit = typeof result.auditResult === 'string' ? result.auditResult : null
+      const ok = result.finishReason === 'stop' && audit !== 'block'
+      return {
+        ok,
+        conversationId: result.conversationId,
+        finishReason: result.finishReason,
+        audit,
+        elapsedMs: Math.max(0, Date.now() - startedAt),
+      }
+    } catch (error) {
+      if (error instanceof UpstreamError) throw error
+      /* AbortSignal.timeout 中断流式读取：统一归为网络超时 */
+      throw new UpstreamNetworkError('云智助手对话超时或连接中断')
+    }
   }
 
   async logout(): Promise<void> {
