@@ -48,6 +48,9 @@ import { ApiError } from './api-error'
 
 const MINUTE = 60_000
 
+/** 与后端一致：error 属稳态可保活，仅 stopped/starting/stopping 暂停计时 */
+const isCountedRun = (run: PcInstance['run']) => run !== 'stopped' && run !== 'starting' && run !== 'stopping'
+
 interface MockPc extends PcInstance {
   /** 下次自动保活的时间戳（内部调度用，不下发） */
   nextAt: number | null
@@ -163,7 +166,7 @@ function seedPc(
   lastMsg: string | null,
   expireDate: number | null = null,
 ): MockPc {
-  const scheduled = auto && run === 'running' && left != null
+  const scheduled = auto && isCountedRun(run) && left != null
   return {
     desktopId,
     desktopName,
@@ -496,12 +499,12 @@ function advanceSchedules(): void {
         pc.transitionTicks = undefined
         pc.run = pc.run === 'starting' ? 'running' : 'stopped'
         state.revision += 1
-        if (pc.auto && pc.run === 'running') schedulePc(pc, account)
+        if (pc.auto && isCountedRun(pc.run)) schedulePc(pc, account)
         continue
       }
-      if (!pc.auto || pc.run !== 'running' || pc.link != null) {
+      if (!pc.auto || !isCountedRun(pc.run) || pc.link != null) {
         pc.left = null
-        if (!pc.auto || pc.run !== 'running') pc.nextAt = null
+        if (!pc.auto || !isCountedRun(pc.run)) pc.nextAt = null
         continue
       }
       if (pc.nextAt == null) pc.nextAt = now + (pc.left ?? account.interval * 60) * 1000
@@ -528,7 +531,7 @@ function advanceSchedules(): void {
 }
 
 function schedulePc(pc: MockPc, account: MockAccount): void {
-  pc.nextAt = pc.auto && pc.run === 'running' ? Date.now() + account.interval * 60 * 1000 : null
+  pc.nextAt = pc.auto && isCountedRun(pc.run) ? Date.now() + account.interval * 60 * 1000 : null
   pc.left = pc.nextAt == null ? null : account.interval * 60
 }
 
@@ -536,7 +539,7 @@ function applyAutoByPosition(account: MockAccount, previous: Account): void {
   account.pcs.forEach((pc, index) => {
     const old = previous.pcs[index]
     pc.auto = old?.auto ?? false
-    if (pc.auto && pc.run === 'running') {
+    if (pc.auto && isCountedRun(pc.run)) {
       pc.left = account.interval * 60
       pc.nextAt = Date.now() + account.interval * 60 * 1000
     }
@@ -713,7 +716,7 @@ export const mockApi: ApiClient = {
     if (!account.points.pointsList.length) account.points = seedPoints()
     if (!account.tasks.length) account.tasks = seedTasks()
     account.pcs.forEach((pc) => {
-      if (pc.auto && pc.run === 'running') {
+      if (pc.auto && isCountedRun(pc.run)) {
         pc.left = account.interval * 60
         pc.nextAt = Date.now() + account.interval * 60 * 1000
       }
@@ -768,7 +771,7 @@ export const mockApi: ApiClient = {
       const interval = body.interval as number
       account.interval = interval
       account.pcs.forEach((pc) => {
-        if (pc.auto && pc.run === 'running') {
+        if (pc.auto && isCountedRun(pc.run)) {
           pc.left = interval * 60
           pc.nextAt = Date.now() + interval * 60 * 1000
         } else {
@@ -793,8 +796,8 @@ export const mockApi: ApiClient = {
     if (!account.pcs.length) account.pcs = demoPcs()
     /* 列表刷新会重算过渡态与倒计时；这里保持已有开关，新实例一律 auto=false */
     account.pcs.forEach((pc) => {
-      if (pc.auto && pc.run === 'running' && pc.nextAt == null) schedulePc(pc, account)
-      if (!pc.auto || pc.run !== 'running') pc.left = null
+      if (pc.auto && isCountedRun(pc.run) && pc.nextAt == null) schedulePc(pc, account)
+      if (!pc.auto || !isCountedRun(pc.run)) pc.left = null
     })
     state.refreshedAt = nowHm()
     state.revision += 1
@@ -806,13 +809,14 @@ export const mockApi: ApiClient = {
     /* banner 判定先于资源查找：报错账号下没有列表，仍应返回 10005 而不是 10003 */
     if (account.banner) throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法保活')
     const pc = findPc(account, desktopId)
-    if (!account.eaichat.ok) {
-      throw new ApiError(ErrorCode.EaichatUnavailable, account.eaichat.msg ?? '云智助手会话不可用，无感保活暂不可用')
-    }
+    /* 拒绝顺序对齐真实后端（manager.keepalive）：run → link → eaichat */
     if (pc.run === 'stopped' || pc.run === 'starting' || pc.run === 'stopping') {
       throw new ApiError(ErrorCode.StateNotAllowed, `实例当前为「${pc.run}」状态，不允许保活`)
     }
     if (pc.link != null) throw new ApiError(ErrorCode.StateNotAllowed, '实例正被积分任务占用，本轮保活暂停')
+    if (!account.eaichat.ok) {
+      throw new ApiError(ErrorCode.EaichatUnavailable, account.eaichat.msg ?? '云智助手会话不可用，无感保活暂不可用')
+    }
 
     await sleep(latency(380, 140))
 

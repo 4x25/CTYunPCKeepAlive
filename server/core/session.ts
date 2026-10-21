@@ -45,6 +45,12 @@ export interface SessionDeps {
   revision: RevisionCounter
   log: (lv: LogLevel, mod: LogModule, msg: string) => void
   refreshed: () => void
+  /** 每次列表成功刷新（登录 / 4.7 / 保活前探测 / 过渡态追踪）后通知调度器 */
+  desktopsUpdated: () => void
+  /** 会话被删除/替换时通知调度器清理定时器 */
+  disposed: () => void
+  /** 计划层派生：按 desktopId 实时读取距下次保活的秒数（调度器持有 nextFireAt） */
+  planLeft: (desktopId: string) => number | null
 }
 
 function emptyPoints(): PointsSummary {
@@ -66,6 +72,10 @@ export class AccountSession {
   private eaichatMsg: string | null = '尚未登录云智助手'
   private desktops: CtyunDesktop[] = []
   private desktopAuto = new Map<string, boolean>()
+  /** 最近一次保活（成功/失败都更新；不持久化，重启后回到「从未执行」） */
+  private desktopLast = new Map<string, { at: number; msg: string }>()
+  /** 列表刷新单飞：4.7 与保活前探测并发时共用同一次上游请求 */
+  private desktopRefresh: Promise<CtyunDesktop[]> | null = null
   private taskAuto = new Map<number, boolean>()
   private tasks: PointTask[] = []
   private points: PointsSummary = emptyPoints()
@@ -112,6 +122,15 @@ export class AccountSession {
     return this.interval
   }
 
+  get pointsWindowSnapshot(): { winStart: string; winEnd: string } {
+    return { ...this.pointsWindow }
+  }
+
+  /** banner 非空 = 账号处于 danger/warn（4.7/4.10/保活一律 10005） */
+  get hasBanner(): boolean {
+    return this.banner != null
+  }
+
   get isLoggedIn(): boolean {
     return this.profile != null
   }
@@ -136,10 +155,68 @@ export class AccountSession {
     return this.eaichatOk
   }
 
+  /** 保活执行需要直接拿 eaichat client；未就绪返回 null（4.8 → 10008） */
+  getEaichatClient(): EaiChatClient | null {
+    return this.eai
+  }
+
+  /** 保活执行/探测写日志的统一出口（manager 注入，内部 bump revision） */
+  log(lv: LogLevel, mod: LogModule, msg: string): void {
+    this.deps.log(lv, mod, msg)
+  }
+
+  /** 4.6 修改保活间隔（调用方负责落盘与重排） */
+  setIntervalMinutes(minutes: number): void {
+    this.interval = minutes
+    this.touch()
+  }
+
+  /** 4.6 修改积分时间窗口 */
+  setPointsWindow(window: { winStart: string; winEnd: string }): void {
+    this.pointsWindow = { ...window }
+    this.touch()
+  }
+
   get autoDesktopCount(): number {
     let count = 0
     for (const value of this.desktopAuto.values()) if (value) count += 1
     return count
+  }
+
+  /** 是否存在任何 auto=true 实例（调度器决定 30 分钟兜底探测） */
+  get hasAutoDesktop(): boolean {
+    for (const value of this.desktopAuto.values()) if (value) return true
+    return false
+  }
+
+  /** 按 desktopId 取当前实例快照 */
+  findDesktop(desktopId: string): CtyunDesktop | undefined {
+    return this.desktops.find((desktop) => desktop.desktopId === desktopId)
+  }
+
+  /** 积分任务对实例的占用（本期恒 null；机制保留，4.8 拒绝条件沿用 link != null） */
+  linkFor(_desktopId: string): number | null {
+    return null
+  }
+
+  get desktopList(): readonly CtyunDesktop[] {
+    return this.desktops
+  }
+
+  /** 调度器写入计划前需要知道「用户是否打开过这台实例的自动开关」 */
+  isDesktopAuto(desktopId: string): boolean {
+    return this.desktopAuto.get(desktopId) ?? false
+  }
+
+  setDesktopAuto(desktopId: string, auto: boolean): void {
+    this.desktopAuto.set(desktopId, auto)
+    this.touch()
+  }
+
+  /** 执行完一次保活：成功/失败都更新 lastAt/lastMsg */
+  recordKeepalive(desktopId: string, at: number, msg: string): void {
+    this.desktopLast.set(desktopId, { at, msg })
+    this.touch()
   }
 
   private touch(): void {
@@ -257,6 +334,8 @@ export class AccountSession {
     this.desktops = []
     this.tasks = []
     this.points = emptyPoints()
+    /* 登录失败：该账号的自动保活计划与过渡态追踪一并取消 */
+    this.deps.disposed()
     this.touch()
     return banner
   }
@@ -282,12 +361,27 @@ export class AccountSession {
 
   /* ── 云电脑列表 ─────────────────────────────────────────── */
 
-  async refreshDesktops(): Promise<void> {
+  /**
+   * 列表刷新（4.7 / 保活前探测共用）：同一账号同一时刻只发一次上游请求，
+   * 并发调用共享结果（过渡态追踪与保活探测不重复请求）。
+   */
+  refreshDesktops(options: { timeoutMs?: number; retries?: number } = {}): Promise<CtyunDesktop[]> {
+    if (this.desktopRefresh) return this.desktopRefresh
+    const run = this.doRefreshDesktops(options).finally(() => {
+      if (this.desktopRefresh === run) this.desktopRefresh = null
+    })
+    this.desktopRefresh = run
+    return run
+  }
+
+  private async doRefreshDesktops(options: { timeoutMs?: number; retries?: number }): Promise<CtyunDesktop[]> {
     if (!this.ctyun) throw new Error('云电脑侧未登录')
-    const list = await this.ctyun.listDesktops()
+    const list = await this.ctyun.listDesktops(options)
     this.applyDesktopList(list)
     this.deps.refreshed()
     this.touch()
+    this.deps.desktopsUpdated()
+    return list
   }
 
   /**
@@ -397,22 +491,43 @@ export class AccountSession {
     this.touch()
   }
 
+  /**
+   * 保活命中 HTTP 401 时的静默重登（backend-design §3.3）：
+   * 重走 eaichat 登录链路后由调用方重试一次；失败原样抛出，由调用方置 10008。
+   */
+  async silentReloginEaichat(budgetMs?: number): Promise<void> {
+    const next = new EaiChatClient({ userAccount: this.userAccount, password: this.password })
+    try {
+      /* 保活链路里重登必须受总预算约束（默认独立登录 28s 会撑破 4.8 的 30s 上限） */
+      await next.loginWithDeadline(budgetMs == null ? undefined : Date.now() + budgetMs)
+    } catch (error) {
+      void next.logout()
+      throw error
+    }
+    this.adoptEaichatClient(next)
+    this.deps.log('INFO', '账号', `${maskOf(this.userAccount)} 云智助手会话已自动重新登录`)
+  }
+
   /* ── 契约输出 ───────────────────────────────────────────── */
 
   toAccount(): Account {
-    const pcs: PcInstance[] = this.desktops.map((desktop) => ({
-      desktopId: desktop.desktopId,
-      desktopName: desktop.desktopName,
-      osType: desktop.osType,
-      run: desktop.run,
-      auto: this.desktopAuto.get(desktop.desktopId) ?? false,
-      /* S2 无调度器：left 一律 null，S3 按 nextFireAt 实时计算 */
-      left: null,
-      link: null,
-      lastAt: null,
-      lastMsg: null,
-      expireDate: desktop.expireDate,
-    }))
+    const pcs: PcInstance[] = this.desktops.map((desktop) => {
+      const last = this.desktopLast.get(desktop.desktopId)
+      return {
+        desktopId: desktop.desktopId,
+        desktopName: desktop.desktopName,
+        osType: desktop.osType,
+        run: desktop.run,
+        auto: this.desktopAuto.get(desktop.desktopId) ?? false,
+        /* 计划层由调度器持有 nextFireAt：请求到达时实时算，不缓存 */
+        left: this.deps.planLeft(desktop.desktopId),
+        /* 「使用1小时」类任务本期不实现（backend-design §4.2），link 恒 null */
+        link: null,
+        lastAt: last?.at ?? null,
+        lastMsg: last?.msg ?? null,
+        expireDate: desktop.expireDate,
+      }
+    })
     return {
       userId: this.userId,
       alias: this.alias,
@@ -467,7 +582,9 @@ export class AccountSession {
     this.eai = null
     this.profile = null
     this.eaichatOk = false
+    this.desktopRefresh = null
     void ctyun?.logout()
     void eai?.logout()
+    this.deps.disposed()
   }
 }

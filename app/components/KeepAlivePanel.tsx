@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'hono/jsx'
+import { MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES } from '../../shared/constants'
 import type { Account, PcInstance } from '../lib/types'
 import { lastCell, pcsEmptyText, refreshedLabel } from '../lib/derive'
 import StatusPill from './StatusPill'
@@ -71,17 +72,24 @@ interface Props {
 export default function KeepAlivePanel(props: Props) {
   const { account: a } = props
   const [draft, setDraft] = useState(() => String(a.interval))
+  const [intervalErr, setIntervalErr] = useState('')
 
   /* 服务端 interval 变化（操作响应 / 快照校正）时同步输入框 */
   useEffect(() => {
     setDraft(String(a.interval))
+    setIntervalErr('')
   }, [a.interval])
 
-  /* 保活间隔：失焦/回车时校验并重排倒计时；可填 1–59，非法输入回落到当前值 */
+  /* 保活间隔：失焦/回车时校验并重排倒计时；可填 1–59，非法输入回滚原值并提示，不静默夹取 */
   const commit = async () => {
-    let v = parseInt(draft, 10)
-    if (isNaN(v)) v = a.interval
-    v = Math.max(1, Math.min(59, v))
+    const text = draft.trim()
+    const v = Number(text)
+    if (!text || !Number.isInteger(v) || v < MIN_INTERVAL_MINUTES || v > MAX_INTERVAL_MINUTES) {
+      setDraft(String(a.interval))
+      setIntervalErr(`保活间隔需为 ${MIN_INTERVAL_MINUTES}–${MAX_INTERVAL_MINUTES} 的整数，已恢复原值`)
+      return
+    }
+    setIntervalErr('')
     setDraft(String(v))
     if (v !== a.interval) {
       const ok = await props.onIntervalCommit(v)
@@ -99,13 +107,18 @@ export default function KeepAlivePanel(props: Props) {
           </span>
           <input
             id="ka-interval"
-            class="input input-xs w-16 text-right font-mono tabular-nums"
+            class={`input input-xs w-16 text-right font-mono tabular-nums ${intervalErr ? 'input-error' : ''}`}
             type="number"
-            min="1"
-            max="59"
+            min={MIN_INTERVAL_MINUTES}
+            max={MAX_INTERVAL_MINUTES}
             step="1"
             value={draft}
-            onInput={(e: InputEvent) => setDraft((e.target as HTMLInputElement).value)}
+            aria-invalid={intervalErr ? 'true' : undefined}
+            aria-describedby={intervalErr ? 'ka-interval-err' : undefined}
+            onInput={(e: InputEvent) => {
+              setDraft((e.target as HTMLInputElement).value)
+              if (intervalErr) setIntervalErr('')
+            }}
             onBlur={commit}
             onKeyDown={(e: KeyboardEvent) => {
               if (e.key === 'Enter') commit()
@@ -116,6 +129,11 @@ export default function KeepAlivePanel(props: Props) {
             label="保活间隔说明"
             tip="可填 1–59。官方空闲回收时长为 60 分钟，默认 19 分钟，留足重试与网络波动的余量。修改后立刻按新间隔重排该账号所有计划。"
           />
+          {intervalErr && (
+            <span id="ka-interval-err" role="alert" class="text-xs font-medium text-error">
+              {intervalErr}
+            </span>
+          )}
           {!a.eaichat.ok && (
             <span class="badge badge-soft badge-warning badge-sm" title={a.eaichat.msg ?? undefined}>
               云智助手会话不可用

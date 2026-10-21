@@ -489,26 +489,35 @@ export class CtyunClient {
    * 云电脑列表：以 sortList 为权威顺序，按 objType 从三类列表取对象合并。
    * getCnt 沿用 research 验证值 20（传 100 上游返回 40050）。
    */
-  async pageDesktop(): Promise<RawPageDesktop> {
+  async pageDesktop(options: { timeoutMs?: number; retries?: number } = {}): Promise<RawPageDesktop> {
     this.deadline = 0
     return this.withHostFallback(() =>
-      this.postJson<RawPageDesktop>('/api/desktop/client/pageDesktop', {
-        getCnt: GET_CNT,
-        desktopTypes: ['1', '2001', '2002'],
-        sortType: 'createTimeV1',
-      }),
+      this.postJson<RawPageDesktop>(
+        '/api/desktop/client/pageDesktop',
+        {
+          getCnt: GET_CNT,
+          desktopTypes: ['1', '2001', '2002'],
+          sortType: 'createTimeV1',
+        },
+        { timeoutMs: options.timeoutMs, retries: options.retries },
+      ),
     )
   }
 
   /** sortList 超过 getCnt 时按 30 个一批补拉缺失的普通桌面（research §5.2） */
-  private async fetchMissingDesktops(missing: string[]): Promise<RawDesktop[]> {
+  private async fetchMissingDesktops(
+    missing: string[],
+    options: { timeoutMs?: number; retries?: number } = {},
+  ): Promise<RawDesktop[]> {
     const out: RawDesktop[] = []
     for (let offset = 0; offset < missing.length; offset += FETCH_BY_IDS_BATCH) {
       const batch = missing.slice(offset, offset + FETCH_BY_IDS_BATCH)
       const data = await this.withHostFallback(() =>
-        this.postJson<{ desktopList?: RawDesktop[] }>('/api/desktop/client/listDesktopByIds', {
-          objIds: batch,
-        }),
+        this.postJson<{ desktopList?: RawDesktop[] }>(
+          '/api/desktop/client/listDesktopByIds',
+          { objIds: batch },
+          { timeoutMs: options.timeoutMs, retries: options.retries },
+        ),
       )
       for (const item of data.desktopList ?? []) {
         const id = item.objId ?? item.desktopId
@@ -518,8 +527,8 @@ export class CtyunClient {
     return out
   }
 
-  async listDesktops(): Promise<CtyunDesktop[]> {
-    const data = await this.pageDesktop()
+  async listDesktops(options: { timeoutMs?: number; retries?: number } = {}): Promise<CtyunDesktop[]> {
+    const data = await this.pageDesktop(options)
     const byId = new Map<string, RawDesktop>()
     for (const item of data.desktopList ?? []) byId.set(String(item.objId ?? item.desktopId), item)
     for (const item of data.desktopPoolList ?? []) byId.set(String(item.objId ?? item.desktopId), item)
@@ -535,7 +544,7 @@ export class CtyunClient {
       }
       if (missing.length) {
         try {
-          const fetched = await this.fetchMissingDesktops(missing)
+          const fetched = await this.fetchMissingDesktops(missing, options)
           for (const item of fetched) byId.set(String(item.objId ?? item.desktopId), item)
           const stillMissing = missing.filter((id) => !byId.has(id))
           if (stillMissing.length) {

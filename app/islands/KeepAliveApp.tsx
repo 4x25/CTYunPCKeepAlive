@@ -13,7 +13,7 @@ import type {
 } from '../lib/types'
 import { api, isApiError, isTimeout } from '../lib/api'
 import { accountFileSlug, accountLabel } from '../lib/derive'
-import { clockOffsetOf, hasStoppedCountdown, hasTransitionalRun, nowWithOffset, projectCountdowns } from '../lib/time'
+import { clockOffsetOf, hasStoppedCountdown, hasTransitionalRun, isKeepaliveCountedRun, nowWithOffset, projectCountdowns } from '../lib/time'
 import AccountTabBar from '../components/AccountTabBar'
 import AccountErrorPanel from '../components/AccountErrorPanel'
 import EmptyAccountPanel from '../components/EmptyAccountPanel'
@@ -631,18 +631,22 @@ export default function KeepAliveApp() {
     try {
       const result = await api.keepalive(userId, desktopId)
       noteRevision(result.revision)
-      /* 同步执行：code=0 也可能 ok=false，不能直接进成功短态 */
+      /* 成功与失败都要落 lastAt/lastMsg（模型 §2.2 的「最近一次保活」包含失败） */
+      patchPc(userId, desktopId, (pc) => ({ ...pc, lastAt: result.lastAt, lastMsg: result.lastMsg, left: result.left }))
+      /* 同步执行：code=0 也可能 ok=false（上游业务拒绝），不展示成功短态、只 Toast 固定文案 */
       if (!result.ok) {
         pushToast(result.lastMsg || '保活失败，请稍后重试')
         void fetchState(result.revision, true)
         return
       }
-      patchPc(userId, desktopId, (pc) => ({ ...pc, lastAt: result.lastAt, lastMsg: result.lastMsg, left: result.left }))
       setJustOkPc((prev) => ({ ...prev, [key]: true }))
       setTimeout(() => setJustOkPc((prev) => withoutKey(prev, key)), 2000)
       void fetchState(result.revision, true)
     } catch (error) {
-      handleError(error)
+      /* 超时与非超时错误一律校正一次 4.1：「最近」及时更新（后端失败分支同样写了 lastAt/lastMsg）。
+         与 handleError 同义（toast + silent 4.1），此处显式展开，避免重复刷新。 */
+      toastError(error)
+      void fetchState(undefined, true)
     } finally {
       manualKeepaliveRef.current.delete(key)
       busyDesktopRef.current.delete(key)
@@ -667,7 +671,7 @@ export default function KeepAliveApp() {
     patchPc(userId, desktopId, (item) => ({
       ...item,
       auto: on,
-      left: on && item.run === 'running' ? (item.left ?? (account?.interval ?? 19) * 60) : null,
+      left: on && isKeepaliveCountedRun(item.run) ? (item.left ?? (account?.interval ?? 19) * 60) : null,
     }))
     try {
       const result = await api.setDesktopAuto(userId, desktopId, on)

@@ -12,22 +12,32 @@ import {
   ERROR_MESSAGES,
   ErrorCode,
   MAX_ACCOUNTS,
+  MAX_INTERVAL_MINUTES,
+  MIN_INTERVAL_MINUTES,
 } from '../../shared/constants'
 import type {
   AddAccountResult,
   CredentialsBody,
   DeleteAccountResult,
+  DesktopsResult,
+  KeepaliveResult,
+  PatchSettingsBody,
+  PatchSettingsResult,
   ReloginResult,
+  RunState,
+  SetDesktopAutoResult,
   StateSnapshot,
   UpdateCredentialsResult,
 } from '../../shared/types'
-import { maskOf, nowHm } from '../../shared/utils'
+import { isHm, maskOf, nowHm } from '../../shared/utils'
 import { ApiError } from '../envelope'
 import type { PersistedAccount, PersistedConfig } from '../store/config'
-import { loadConfig, saveConfig } from '../store/config'
+import { CONFIG_DIR, loadConfig, saveConfig } from '../store/config'
 import { appendLog, clearAccountLogs, ensureLogDir } from '../store/logs'
 import { UpstreamError, upstreamMessage } from '../upstream/errors'
 import { AccountSession, LOGIN_BUDGET_MS, RevisionCounter } from './session'
+import { scheduler } from './scheduler'
+import type { KeepaliveOutcome } from './keepalive'
 
 function sessionApiMessage(code: number): string {
   switch (code) {
@@ -52,6 +62,19 @@ function sessionApiMessage(code: number): string {
 
 function errorCode(error: unknown): number {
   return error instanceof UpstreamError ? error.code : -1
+}
+
+const RUN_LABEL: Record<RunState, string> = {
+  running: '运行中',
+  starting: '启动中',
+  stopping: '关机中',
+  stopped: '已关机',
+  error: '异常',
+}
+
+/** 4.8/4.9 的拒绝口径：stopped/starting/stopping 不允许；error 属稳态可保活 */
+function isEligibleRun(run: RunState): boolean {
+  return run === 'running' || run === 'error'
 }
 
 export class AccountManager {
@@ -275,6 +298,8 @@ export class AccountManager {
     const replacedIds = existing.map((item) => item.userId)
     for (const old of existing) old.dispose()
     for (const oldUserId of replacedIds) clearAccountLogs(oldUserId)
+    /* 新账号的自动开关全部默认关闭；确保没有同 userId 的残留计划 */
+    scheduler.syncSession(session)
     if (replaced) {
       this.logSystem(
         'INFO',
@@ -354,6 +379,8 @@ export class AccountManager {
 
     draft.inheritSettingsFrom(previous)
     draft.finalizeLogin()
+    /* 继承的 auto 开关要立刻生效（登录时的列表拉取发生在继承之前） */
+    scheduler.syncSession(draft)
 
     const displaced = this.sessions.filter((item) => item !== previous && item.userId === draft.userId)
     const sameUserId = draft.userId === previous.userId
@@ -364,7 +391,9 @@ export class AccountManager {
     try {
       await this.persistSessions(remaining)
     } catch (error) {
+      /* 落盘失败：新会话作废，旧会话的计划按原状态恢复（syncSession 已先清过旧计划） */
       draft.dispose()
+      scheduler.syncSession(previous)
       throw error
     }
 
@@ -427,6 +456,8 @@ export class AccountManager {
     try {
       const warnings = await this.loginSession(session)
       session.finalizeLogin()
+      /* banner 期间被取消的计划在重新登录成功后恢复（列表拉取早于 finalize） */
+      scheduler.syncSession(session)
       const suffix = warnings.length
         ? warnings.every((warning) => warning.includes('云智助手'))
           ? ' · 云智助手会话不可用，无感保活暂不可用'
@@ -471,6 +502,7 @@ export class AccountManager {
 
     this.sessions = next
     const removedUserId = session.userId
+    /* dispose 内部通知 scheduler.dropSession：取消该账号全部计划/追踪/兜底定时器 */
     session.dispose()
     clearAccountLogs(removedUserId)
     this.logSystem(
@@ -479,6 +511,219 @@ export class AccountManager {
       `已删除账号 ${label} · 配置文件中该条（含 password）已整条移除并覆盖写盘 · 该账号的日志已随之删除`,
     )
     return null
+  }
+
+  /* ── 4.6 修改设置 ───────────────────────────────────────── */
+
+  async updateSettings(userId: number, body: PatchSettingsBody): Promise<PatchSettingsResult> {
+    await this.ready()
+    const session = this.requireSession(userId)
+    const hasInterval = body.interval !== undefined
+    const hasWindow = body.pointsWindow !== undefined
+    if (!hasInterval && !hasWindow) throw new ApiError(ErrorCode.InvalidParam, '参数校验失败：至少传一个字段')
+
+    const previousInterval = session.intervalMinutes
+    const previousWindow = session.pointsWindowSnapshot
+
+    if (hasInterval) {
+      const interval = body.interval as number
+      if (!Number.isInteger(interval) || interval < MIN_INTERVAL_MINUTES || interval > MAX_INTERVAL_MINUTES) {
+        throw new ApiError(
+          ErrorCode.InvalidParam,
+          `参数校验失败：保活间隔需为 ${MIN_INTERVAL_MINUTES}–${MAX_INTERVAL_MINUTES} 分钟`,
+        )
+      }
+      session.setIntervalMinutes(interval)
+    }
+    if (hasWindow) {
+      const { winStart, winEnd } = body.pointsWindow as { winStart: string; winEnd: string }
+      if (!isHm(winStart) || !isHm(winEnd)) {
+        session.setIntervalMinutes(previousInterval)
+        throw new ApiError(ErrorCode.InvalidParam, '参数校验失败：积分时间窗口格式需为 HH:mm')
+      }
+      if (winStart >= winEnd) {
+        session.setIntervalMinutes(previousInterval)
+        throw new ApiError(ErrorCode.InvalidParam, '参数校验失败：积分时间窗口起止时间倒置')
+      }
+      session.setPointsWindow({ winStart, winEnd })
+    }
+
+    try {
+      await this.persistSessions(this.sessions)
+    } catch (error) {
+      session.setIntervalMinutes(previousInterval)
+      session.setPointsWindow(previousWindow)
+      throw error
+    }
+
+    if (hasInterval) {
+      scheduler.applyInterval(session)
+      this.logAccount(
+        session,
+        'INFO',
+        '保活',
+        `${maskOf(session.accountName)} 保活间隔已改为 ${session.intervalMinutes} 分钟，全部自动保活计划已按新间隔重排`,
+      )
+    }
+    if (hasWindow) {
+      this.logAccount(
+        session,
+        'INFO',
+        '积分',
+        `${maskOf(session.accountName)} 积分任务时间窗口已改为 ${session.pointsWindowSnapshot.winStart}–${session.pointsWindowSnapshot.winEnd}`,
+      )
+    }
+
+    return { revision: this.revision.value, account: session.toAccount() }
+  }
+
+  /* ── 4.7 刷新云电脑列表 ─────────────────────────────────── */
+
+  async listDesktops(userId: number): Promise<DesktopsResult> {
+    await this.ready()
+    const session = this.requireSession(userId)
+    if (session.hasBanner) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法获取云电脑列表')
+    }
+    try {
+      await session.refreshDesktops({ timeoutMs: 10_000, retries: 0 })
+    } catch (error) {
+      throw this.toApiError(error)
+    }
+    return { refreshedAt: nowHm(), pcs: session.toAccount().pcs }
+  }
+
+  /* ── 4.8 手动保活 ───────────────────────────────────────── */
+
+  async keepalive(userId: number, desktopId: string): Promise<KeepaliveResult> {
+    await this.ready()
+    const session = this.requireSession(userId)
+    if (session.hasBanner) throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法保活')
+
+    const desktop = session.findDesktop(desktopId)
+    if (!desktop) throw new ApiError(ErrorCode.DesktopNotFound, ERROR_MESSAGES[ErrorCode.DesktopNotFound])
+    if (!isEligibleRun(desktop.run)) {
+      throw new ApiError(
+        ErrorCode.StateNotAllowed,
+        `实例当前为「${RUN_LABEL[desktop.run]}」状态，不允许保活（工具不代为开机）`,
+      )
+    }
+    if (session.linkFor(desktopId) != null) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '实例正被积分任务占用，本轮保活暂停')
+    }
+    if (!session.isEaichatReady) {
+      throw new ApiError(ErrorCode.EaichatUnavailable, ERROR_MESSAGES[ErrorCode.EaichatUnavailable])
+    }
+
+    const outcome = await scheduler.manual(session, desktopId)
+    /* 网络/会话类失败才走错误信封；上游业务拒绝按 4.8 契约用 ok=false + lastMsg 表达 */
+    if (!outcome.ok && outcome.failureKind === 'network') {
+      throw new ApiError(ErrorCode.UpstreamNetwork, outcome.apiMsg ?? '保活请求失败，请稍后重试')
+    }
+    if (!outcome.ok && outcome.failureKind === 'auth') {
+      throw new ApiError(ErrorCode.EaichatUnavailable, outcome.apiMsg ?? ERROR_MESSAGES[ErrorCode.EaichatUnavailable])
+    }
+
+    return {
+      revision: this.revision.value,
+      desktopId,
+      ok: outcome.ok,
+      elapsedMs: outcome.elapsedMs,
+      lastAt: outcome.lastAt,
+      lastMsg: outcome.lastMsg,
+      /* 契约口径：auto=true 时按 interval 重排，否则 null */
+      left: session.isDesktopAuto(desktopId) ? session.intervalMinutes * 60 : null,
+    }
+  }
+
+  /* ── 4.9 切换自动保活 ───────────────────────────────────── */
+
+  async setDesktopAuto(userId: number, desktopId: string, auto: boolean): Promise<SetDesktopAutoResult> {
+    await this.ready()
+    const session = this.requireSession(userId)
+
+    const desktop = session.findDesktop(desktopId)
+    if (!desktop) throw new ApiError(ErrorCode.DesktopNotFound, ERROR_MESSAGES[ErrorCode.DesktopNotFound])
+
+    /* 关闭永远允许（账号处于 banner 期间也允许关闭） */
+    if (!auto) {
+      const wasAuto = session.isDesktopAuto(desktopId)
+      session.setDesktopAuto(desktopId, false)
+      scheduler.disable(session, desktopId)
+      try {
+        await this.persistSessions(this.sessions)
+      } catch (error) {
+        session.setDesktopAuto(desktopId, wasAuto)
+        /* 回滚开关后按当前状态恢复计划（重新按间隔计时） */
+        if (wasAuto) scheduler.syncSession(session)
+        throw error
+      }
+      this.logAccount(
+        session,
+        'INFO',
+        '保活',
+        `${desktop.desktopName} 已关闭自动保活（该实例不再产生任何保活请求）`,
+      )
+      return { revision: this.revision.value, desktopId, auto: false, left: null }
+    }
+
+    /* 打开：受账号 banner、实例状态、link 占用与 eaichat 会话限制 */
+    if (session.hasBanner) throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法修改自动保活')
+    if (!isEligibleRun(desktop.run)) {
+      throw new ApiError(
+        ErrorCode.StateNotAllowed,
+        `实例当前为「${RUN_LABEL[desktop.run]}」状态，不允许开启自动保活（工具不代为开机）`,
+      )
+    }
+    if (session.linkFor(desktopId) != null) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '实例正被积分任务占用，本轮保活暂停')
+    }
+    if (!session.isEaichatReady) {
+      throw new ApiError(ErrorCode.EaichatUnavailable, ERROR_MESSAGES[ErrorCode.EaichatUnavailable])
+    }
+
+    const wasAuto = session.isDesktopAuto(desktopId)
+    session.setDesktopAuto(desktopId, true)
+    let outcome: KeepaliveOutcome | null
+    try {
+      /* 打开开关立即执行一次（后端内部同步）；探测后状态不再允许时 executeRound 抛 10005/10008 并回滚 */
+      outcome = await scheduler.enable(session, desktopId)
+      /* 网络/会话类失败＝立即保活没有执行成功：整个开关操作不生效（对齐「失败时操作不生效」） */
+      if (!outcome.ok && outcome.failureKind === 'network') {
+        throw new ApiError(ErrorCode.UpstreamNetwork, outcome.apiMsg ?? ERROR_MESSAGES[ErrorCode.UpstreamNetwork])
+      }
+      if (!outcome.ok && outcome.failureKind === 'auth') {
+        throw new ApiError(ErrorCode.EaichatUnavailable, outcome.apiMsg ?? ERROR_MESSAGES[ErrorCode.EaichatUnavailable])
+      }
+    } catch (error) {
+      session.setDesktopAuto(desktopId, wasAuto)
+      /* 回滚计划：原本就开着则重新对齐，否则彻底取消 */
+      if (wasAuto) scheduler.syncSession(session)
+      else scheduler.disable(session, desktopId)
+      throw error
+    }
+
+    try {
+      await this.persistSessions(this.sessions)
+    } catch (error) {
+      session.setDesktopAuto(desktopId, wasAuto)
+      if (wasAuto) scheduler.syncSession(session)
+      else scheduler.disable(session, desktopId)
+      throw error
+    }
+
+    this.logAccount(
+      session,
+      'INFO',
+      '保活',
+      `${desktop.desktopName} 已开启自动保活（立即执行${outcome.ok ? '成功' : '失败，下个周期重试'}，随后每 ${session.intervalMinutes} 分钟一轮）`,
+    )
+    return {
+      revision: this.revision.value,
+      desktopId,
+      auto: true,
+      left: session.intervalMinutes * 60,
+    }
   }
 
   /* ── 登录编排 / 持久化 / 错误映射 ────────────────────────── */
@@ -518,6 +763,12 @@ export class AccountManager {
       refreshed: () => {
         this.refreshedAt = nowHm()
       },
+      /* 列表刷新后对齐计划（run 变化即时反作用于计划、恢复计时） */
+      desktopsUpdated: () => scheduler.syncSession(session),
+      /* 删除/替换/登录失败：清掉该会话全部定时器与追踪任务 */
+      disposed: () => scheduler.dropSession(session),
+      /* left 实时派生：nextFireAt - now() */
+      planLeft: (desktopId: string) => scheduler.leftFor(session.userId, desktopId),
     }
     session = new AccountSession(persisted, deps)
     return session
@@ -552,7 +803,7 @@ export class AccountManager {
     try {
       await saveConfig(config)
     } catch {
-      throw new ApiError(ErrorCode.UpstreamNetwork, '配置保存失败，请检查 ~/.ctyun-pc-keep-alive 目录权限')
+      throw new ApiError(ErrorCode.UpstreamNetwork, `配置保存失败，请检查 ${CONFIG_DIR} 目录权限`)
     }
   }
 

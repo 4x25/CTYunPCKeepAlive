@@ -480,6 +480,58 @@ export class EaiChatClient {
     }
   }
 
+  /**
+   * 无感保活：`prevent-power-strategy`（backend-design §3.1 / §6.3）。
+   *
+   * 成功判定是 **HTTP 200 且响应 `code === 0`**——此接口不使用
+   * `resultCode`/`success`。`desktopName` 必须传 base64（服务端会解码，
+   * 中文原名会触发 1001），`desktopUuid` 用列表里的 `foreignDesktopId`。
+   * 营销/签名头不是必需；只带 JWT + Accept，保持与真实调用一致。
+   */
+  async preventPowerStrategy(options: {
+    desktopName: string
+    desktopUuid: string
+    sourceType?: number
+    timeoutMs?: number
+  }): Promise<void> {
+    if (!this.jwt) throw new UpstreamError(40010, '云智助手未登录')
+
+    const url = new URL('/api/v3/openclaw-hub/desktops/prevent-power-strategy', this.eaiBase)
+    url.searchParams.set('desktopName', Buffer.from(options.desktopName, 'utf8').toString('base64'))
+    url.searchParams.set('desktopUuid', options.desktopUuid)
+    url.searchParams.set('sourceType', String(options.sourceType ?? 0))
+
+    const res = await this.rawFetch(url.toString(), {
+      headers: { accept: 'application/json', 'YL-Authorization': `Bearer ${this.jwt}` },
+      timeoutMs: options.timeoutMs ?? 30_000,
+    })
+    const text = await res.text()
+
+    if (res.status === 401) {
+      this.jar.clear()
+      this.sk = null
+      this.jwt = null
+      this.tenantId = null
+      this.loginAt = null
+      throw new UpstreamError(40010, '云智助手会话已过期（HTTP 401）')
+    }
+    if (res.status !== 200) {
+      throw new UpstreamNetworkError(`云智助手保活接口 HTTP ${res.status}`)
+    }
+
+    let json: JsonRecord
+    try {
+      json = text ? (JSON.parse(text) as JsonRecord) : {}
+    } catch {
+      throw new UpstreamNetworkError('云智助手保活响应不是 JSON')
+    }
+    const code = Number(json.code)
+    /* 不透传上游 message：只保留 code 供上层分类，文案由 keepalive.ts 固定生成 */
+    if (!Number.isFinite(code) || code !== 0) {
+      throw new UpstreamError(Number.isFinite(code) ? code : -1, '云智助手保活策略被拒绝')
+    }
+  }
+
   /** S4 用：单轮流式对话；本期保留完整实现，不做任务编排 */
   async chat(
     message: string,

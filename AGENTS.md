@@ -49,8 +49,9 @@ server/                  /api 后端（同进程挂载；按业务纵切补齐�
   envelope.ts            ok / err / ApiError
   routes/                accounts.ts（4.2–4.5）、logs.ts（4.1 /state；4.13/4.14 在 S5）
   core/                  manager.ts（账号生命周期/启动恢复）、session.ts（双平台登录态与快照）
+                         scheduler.ts（每实例定时器/探测/过渡态追踪）、keepalive.ts（保活执行）、warn-throttle.ts
   upstream/              ctyun-client.ts / eaichat-client.ts / crypto.ts / errors.ts
-  store/                 config.ts（~/.ctyun-pc-keep-alive/config.json 原子写）、logs.ts（内存 ring + 磁盘）
+  store/                 config.ts（~/.ctyun-pc-keep-alive/config.json 原子写，可用 CTYUN_PC_KEEPALIVE_HOME 覆盖）、logs.ts（内存 ring + 磁盘）
 ```
 
 ## 约定

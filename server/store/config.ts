@@ -6,14 +6,56 @@
  * - 文件权限 0600，目录 0700
  * - 只持久化凭据、间隔、时间窗口、实例/任务 auto 开关与 Tab 顺序
  * - 会话密钥 / JWT / 运行期展示数据一律不落盘
+ *
+ * 配置根目录可用 `CTYUN_PC_KEEPALIVE_HOME` 覆盖（测试/联调沙箱）；
+ * 测试环境（NODE_ENV=test 或 VITEST）未显式指定时强制落到系统临时目录，
+ * 并拒绝指向真实配置目录的覆盖，避免脚本误写用户配置。
  */
 import { chmod, mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { z } from 'zod'
 
-export const CONFIG_DIR = path.join(os.homedir(), '.ctyun-pc-keep-alive')
+const CONFIG_DIR_NAME = '.ctyun-pc-keep-alive'
+
+function expandHome(input: string): string {
+  if (input === '~') return os.homedir()
+  if (input.startsWith('~/') || input.startsWith('~\\')) return path.join(os.homedir(), input.slice(2))
+  return input
+}
+
+function isTestEnv(): boolean {
+  return process.env.NODE_ENV === 'test' || process.env.VITEST != null
+}
+
+/** 是否落在真实 HOME 内（测试环境不许写真实 HOME 的任何位置） */
+function isInsideRealHome(resolved: string): boolean {
+  const home = path.resolve(os.homedir())
+  return resolved === home || resolved.startsWith(`${home}${path.sep}`)
+}
+
+function resolveConfigDir(): string {
+  const realHomeDir = path.join(os.homedir(), CONFIG_DIR_NAME)
+  const override = process.env.CTYUN_PC_KEEPALIVE_HOME?.trim()
+  if (override) {
+    const resolved = path.resolve(expandHome(override))
+    if (isTestEnv() && isInsideRealHome(resolved)) {
+      throw new Error(
+        'CTYUN_PC_KEEPALIVE_HOME 指向真实 HOME：测试环境禁止使用真实配置目录，请改为系统临时目录（或删除该变量让测试自动落到临时目录）',
+      )
+    }
+    return resolved
+  }
+  if (isTestEnv()) {
+    /* 测试/脚本没有显式沙箱：强制使用临时目录，绝不触碰用户真实配置 */
+    return path.join(os.tmpdir(), `ctyun-pc-keep-alive-test-${process.pid}`)
+  }
+  return realHomeDir
+}
+
+export const CONFIG_DIR = resolveConfigDir()
 export const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json')
+/** 日志目录跟随配置根目录（沙箱下同样隔离） */
 export const LOG_DIR = path.join(CONFIG_DIR, 'log')
 
 const PointsWindowSchema = z.object({
