@@ -31,3 +31,17 @@ lerna-debug.log*
 
 # misc
 .DS_Store
+
+# secrets
+# internal docs (fetched from private gist; not for publication)
+docs/
+
+# research artifacts (may contain credentials/session material)
+research/*.har
+research/*.session.json
+research/.eaichat-session.json
+research/artifacts/
+research/bundles/
+research/iam-bundles/
+research/samples.json
+research/list.json
