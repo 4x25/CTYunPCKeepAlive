@@ -12,6 +12,7 @@ export type {
   LogEntry,
   LogLevel,
   LogModule,
+  LogQuery,
   PcInstance,
   PointTask,
   RunState,
@@ -38,7 +39,7 @@ export interface LogView {
   loading: boolean
 }
 
-/** 日志筛选条件（当前为全局，后续可下沉到每账号） */
+/** 日志筛选条件（按账号各存一份，切 Tab 不串味） */
 export interface LogFilters {
   lv: string
   mod: string

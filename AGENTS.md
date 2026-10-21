@@ -46,8 +46,9 @@ shared/                  前后端共享层（不得 import app/ 或 server/）
   utils.ts               时间格式化（nowStr/nowHm/formatHm/formatHms）、maskOf、isHm
 server/                  /api 后端（同进程挂载；按业务纵切补齐）
   index.ts               /api 子应用：路由挂载、未匹配 404、统一错误信封
+  boot.ts                进程纪元 bootId（前端据此重置 revision/日志增量水位）
   envelope.ts            ok / err / ApiError
-  routes/                accounts.ts（4.2–4.5）、desktops.ts（4.6–4.9）、points.ts（4.10–4.12）、logs.ts（4.1 /state；4.13/4.14 在 S5）
+  routes/                accounts.ts（4.2–4.5）、desktops.ts（4.6–4.9）、points.ts（4.10–4.12）、logs.ts（4.1 /state、4.13/4.14）
   core/                  manager.ts（账号生命周期/启动恢复）、session.ts（双平台登录态与快照）
                          scheduler.ts（每实例定时器/探测/过渡态追踪）、keepalive.ts（保活执行）
                          points.ts（积分聚合/可执行任务集）、task-runner.ts（积分任务编排）、warn-throttle.ts

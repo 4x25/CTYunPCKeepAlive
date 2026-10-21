@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'hono/jsx'
 import type { LogEntry, LogLevel } from '../lib/types'
 import { logTime } from '../lib/derive'
 
@@ -34,6 +35,16 @@ interface Props {
 export default function LogPanel(props: Props) {
   const { rows, total } = props
   const filtering = props.lv !== 'ALL' || props.mod !== 'ALL' || !!props.kw.trim() || props.includeSys
+
+  /* 行按 seq 倒序（最新在上）：增量到达且开关开启时把滚动条按回顶部（frontend-design §6.2） */
+  const boxRef = useRef<HTMLDivElement>(null)
+  const headSeq = rows.length ? rows[0].seq : 0
+  useEffect(() => {
+    if (!props.autoScroll) return
+    const box = boxRef.current
+    if (box) box.scrollTop = 0
+  }, [headSeq, props.autoScroll])
+
   return (
     <div role="tabpanel" aria-label="运行日志" class="flex h-full min-h-0 flex-col">
       <div class="mb-2.5 flex flex-wrap items-center gap-2.5">
@@ -74,7 +85,7 @@ export default function LogPanel(props: Props) {
           <input
             type="checkbox"
             class="toggle toggle-sm"
-            aria-label="自动滚动到底部"
+            aria-label="自动滚动到最新"
             checked={props.autoScroll}
             onChange={(e: Event) => props.onAutoScroll((e.target as HTMLInputElement).checked)}
           />
@@ -89,7 +100,7 @@ export default function LogPanel(props: Props) {
         </button>
       </div>
 
-      <div class="min-h-0 flex-1 overflow-y-auto border-y border-base-300">
+      <div ref={boxRef} class="min-h-0 flex-1 overflow-y-auto border-y border-base-300">
         {!rows.length && props.loading ? (
           <div class="flex items-center justify-center gap-2 py-7 text-[13px] text-base-content/60" role="status">
             <span class="loading loading-spinner loading-sm" aria-hidden="true" />

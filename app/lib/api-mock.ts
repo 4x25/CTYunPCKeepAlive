@@ -50,6 +50,9 @@ import { ApiError } from './api-error'
 
 const MINUTE = 60_000
 
+/** mock 的 bootId：模块加载时生成一次（与真实后端「每次进程启动一次」同口径） */
+const MOCK_BOOT_ID = `mock-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+
 /** 与后端一致：error 属稳态可保活，仅 stopped/starting/stopping 暂停计时 */
 const isCountedRun = (run: PcInstance['run']) => run !== 'stopped' && run !== 'starting' && run !== 'stopping'
 
@@ -71,6 +74,8 @@ interface MockState {
   revision: number
   seq: number
   refreshedAt: string
+  /** 进程纪元：mock 生命周期内恒定（前端 bootId 变更 = 重置本地水位） */
+  bootId: string
 }
 
 interface RawLog {
@@ -414,6 +419,7 @@ function buildSeedState(): MockState {
     revision: 0,
     seq,
     refreshedAt: '14:32',
+    bootId: MOCK_BOOT_ID,
   }
 }
 
@@ -476,6 +482,7 @@ function toAccount(account: MockAccount): Account {
 function toSnapshot(): StateSnapshot {
   return {
     serverTime: Date.now(),
+    bootId: state.bootId,
     revision: state.revision,
     maxAccounts: MAX_ACCOUNTS,
     refreshedAt: state.refreshedAt,
@@ -1009,7 +1016,7 @@ export const mockApi: ApiClient = {
     await sleep(latency(60, 60))
     let source: LogEntry[] = []
     if (query.userId !== undefined) {
-      findAccount(query.userId)
+      /* 与真实后端同口径：账号已不存在（删除/顶替）时给空结果，不抛 10002 */
       source = [...(state.logs.get(query.userId) ?? [])]
     } else {
       for (const account of state.accounts) source.push(...(state.logs.get(account.userId) ?? []))

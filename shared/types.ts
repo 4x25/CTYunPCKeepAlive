@@ -136,7 +136,7 @@ export interface Account {
 
 /** 日志（api.md §2.5） */
 export interface LogEntry {
-  /** 全局单调递增序号（新条目更大） */
+  /** 进程内全局单调递增序号（新条目更大；进程重启后归零，纪元由 /state 的 bootId 标识） */
   seq: number
   /** "YYYY-MM-DD HH:mm:ss" */
   t: string
@@ -191,7 +191,13 @@ export interface LogQuery {
 export interface StateSnapshot {
   /** 服务端毫秒时间，前端校准本地时钟 */
   serverTime: number
-  /** 账号内存态单调递增版本号 */
+  /**
+   * 进程纪元：每次后端启动生成一次，进程内恒定。
+   * 变化 = 服务端已重启：`revision`/日志 `seq` 从 0 重新计数，
+   * 前端必须先重置本地水位与日志缓存，再应用新快照。
+   */
+  bootId: string
+  /** 账号内存态单调递增版本号（进程内单调；跨进程由 bootId 标识） */
   revision: number
   maxAccounts: number
   /** 最近一次云电脑列表成功刷新时间（"HH:mm"，契约不接受 null） */

@@ -553,7 +553,10 @@ export class AccountSession {
     }
     if (dropped.length) {
       const names = new Map(this.desktops.map((desktop) => [desktop.desktopId, desktop.desktopName]))
-      const detail = dropped.map((id) => names.get(id) ?? id).join('、')
+      /* 上游 ID 不得进日志/磁盘：名称未知时只按序号占位 */
+      const detail = dropped
+        .map((id, index) => names.get(id) ?? `已不在列表的实例（第 ${index + 1} 台）`)
+        .join('、')
       this.deps.log(
         'WARN',
         '账号',

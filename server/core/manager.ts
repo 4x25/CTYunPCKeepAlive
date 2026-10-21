@@ -33,10 +33,11 @@ import type {
   UpdateCredentialsResult,
 } from '../../shared/types'
 import { isHm, maskOf, nowHm } from '../../shared/utils'
+import { BOOT_ID } from '../boot'
 import { ApiError } from '../envelope'
 import type { PersistedAccount, PersistedConfig } from '../store/config'
 import { CONFIG_DIR, loadConfig, saveConfig } from '../store/config'
-import { appendLog, clearAccountLogs, ensureLogDir } from '../store/logs'
+import { appendLog, clearAccountLogs, getSystemLogs, initLogStore, LOG_RETENTION_DAYS } from '../store/logs'
 import { UpstreamError, upstreamMessage } from '../upstream/errors'
 import { AccountSession, LOGIN_BUDGET_MS, RevisionCounter } from './session'
 import { isExecutableTask } from './points'
@@ -104,10 +105,14 @@ export class AccountManager {
   }
 
   private async loadConfigIntoMemory(): Promise<void> {
-    await ensureLogDir()
+    /* 日志目录就绪 + 跨天归档 + 清理 7 天前的文件；清理数量写一条系统日志（backend-design §7.2） */
+    const { removedFiles } = await initLogStore()
     this.refreshedAt = ''
     const { config, error } = await loadConfig()
     if (error) this.logSystem('WARN', '系统', error)
+    if (removedFiles > 0) {
+      this.logSystem('INFO', '系统', `按「日志保留 ${LOG_RETENTION_DAYS} 天」清理了 ${removedFiles} 个超期日志文件`)
+    }
     for (const account of config.accounts) {
       this.sessions.push(this.createSession(account))
     }
@@ -189,6 +194,16 @@ export class AccountManager {
             (session.isEaichatReady ? ' · 云智助手会话就绪' : ' · 云智助手会话不可用'),
         )
       } catch (error) {
+        const code = errorCode(error)
+        /* 登录期间该账号已被删除/顶替：不得再用它的 userId 写日志（会重建已删的 ring），降级到系统日志 */
+        if (!this.sessions.includes(session)) {
+          this.logSystem(
+            'WARN',
+            '系统',
+            `${label} 启动恢复被中断：账号在恢复期间已被移除，本次失败仅记入系统日志`,
+          )
+          continue
+        }
         /* relogin/修正凭据可能在等待期间已让该账号登录成功：失败不得覆盖 */
         if (session.isLoggedIn) {
           this.logAccount(
@@ -199,7 +214,6 @@ export class AccountManager {
           )
           continue
         }
-        const code = errorCode(error)
         session.markLoginFailure(error)
         this.logAccount(
           session,
@@ -253,12 +267,14 @@ export class AccountManager {
     await this.ready()
     return {
       serverTime: Date.now(),
+      /* 进程纪元：后端重启后 revision/日志 seq 归零，前端据 bootId 重置本地水位 */
+      bootId: BOOT_ID,
       revision: this.revision.value,
       maxAccounts: MAX_ACCOUNTS,
       refreshedAt: this.refreshedAt,
       accounts: this.sessions.map((session) => session.toAccount()),
-      /* S2 的日志面板尚未接入：系统日志只写内存 ring + system.jsonl，/state 暂不下发（S5 补齐） */
-      syslogs: [],
+      /* 无账号归属的最近系统日志；账号日志由 4.13 按 userId 拉取 */
+      syslogs: getSystemLogs(),
     }
   }
 
@@ -831,6 +847,21 @@ export class AccountManager {
       )
     }
     return { revision: this.revision.value, taskDefId, auto }
+  }
+
+  /* ── 4.14 清空界面日志 ──────────────────────────────────── */
+
+  /**
+   * 只清该账号的内存日志缓冲：磁盘文件按 7 天保留（backend-design §7.2），
+   * `seq` 不重置，清空后新条目仍然更大（前端 sinceSeq 增量无需处理回绕）。
+   */
+  async clearLogs(userId: number): Promise<null> {
+    await this.ready()
+    const session = this.requireSession(userId)
+    const label = maskOf(session.accountName)
+    clearAccountLogs(userId)
+    this.logSystem('INFO', '系统', `已清空 ${label} 的界面日志 · 磁盘上的日志文件不受影响`)
+    return null
   }
 
   /* ── 登录编排 / 持久化 / 错误映射 ────────────────────────── */
