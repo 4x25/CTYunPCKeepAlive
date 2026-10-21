@@ -78,7 +78,7 @@ export interface PointTask {
   totalProgress: number
   status: TaskStatus
   /** false 时进度列显示「—」 */
-  isDisplayProgress: boolean
+  isDisplayProgress: boolean | null
   /** 手动执行中 */
   busy: boolean
   /** 自动执行开关（本工具持久化） */

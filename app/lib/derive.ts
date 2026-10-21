@@ -79,7 +79,8 @@ export function isDurationTask(taskDefId: number): boolean {
 
 /** 进度文本：次数型 "1 / 1 次"；时长型 "24 / 60 分钟"；不展示进度时 "—" */
 export function taskProgressText(task: PointTask): string {
-  if (!task.isDisplayProgress) return '—'
+  /* 上游 isDisplayProgress 实测为 null：仅明确 false 时隐藏 */
+  if (task.isDisplayProgress === false) return '—'
   if (isDurationTask(task.taskDefId)) {
     return `${Math.floor(task.currentProgress / 60)} / ${Math.floor(task.totalProgress / 60)} 分钟`
   }
@@ -88,7 +89,7 @@ export function taskProgressText(task: PointTask): string {
 
 /** 进度条比例 0–1 */
 export function taskProgressRatio(task: PointTask): number {
-  if (!task.isDisplayProgress || !task.totalProgress) return 0
+  if (task.isDisplayProgress === false || !task.totalProgress) return 0
   return Math.max(0, Math.min(1, task.currentProgress / task.totalProgress))
 }
 
@@ -116,7 +117,10 @@ export function rewardOf(task: PointTask): number {
 }
 
 export function pointsTotal(summary: PointsSummary): number {
-  return summary.pointsList.reduce((sum, item) => sum + item.points, 0)
+  /* 主数字取「通用积分」(pointType=1)；云智手机通用积分(500) 等其它分组只在明细展示，不合并计数 */
+  const general = summary.pointsList.filter((item) => item.pointType === 1)
+  const list = general.length > 0 ? general : summary.pointsList
+  return list.reduce((sum, item) => sum + item.points, 0)
 }
 
 /** 主数字格式化：1280 → 1,280 */

@@ -137,7 +137,7 @@ export default function PointsPanel(props: Props) {
                 <tr key={task.taskDefId} class="row-hover">
                   <td class="text-[13px] font-semibold">{task.taskDefName}</td>
                   <td class="font-mono tabular-nums">+{rewardOf(task)}</td>
-                  <td class="min-w-28" title={task.isDisplayProgress ? undefined : '该任务不展示进度'}>
+                  <td class="min-w-28" title={task.isDisplayProgress === false ? '该任务不展示进度' : undefined}>
                     <span class="block font-mono text-[11.5px] tabular-nums whitespace-nowrap text-base-content/60">
                       {taskProgressText(task)}
                     </span>
