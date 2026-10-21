@@ -18,8 +18,8 @@ interface Props {
 /** 添加账号 / 重新登录·修正凭据 表单（挂在 ModalLayer 里） */
 export default function AddAccountForm({ edit, busy, onSubmit, onClose }: Props) {
   const isFix = edit !== null
-  const [acct, setAcct] = useState(edit?.full ?? '')
-  const [pw, setPw] = useState(edit?.pw ?? '')
+  const [acct, setAcct] = useState(edit?.userAccount ?? '')
+  const [pw, setPw] = useState(edit?.password ?? '')
   const [alias, setAlias] = useState(edit?.alias ?? '')
   const [showPw, setShowPw] = useState(false)
   const [acctErr, setAcctErr] = useState('')
@@ -27,6 +27,8 @@ export default function AddAccountForm({ edit, busy, onSubmit, onClose }: Props)
 
   /* 只做必填：账号与密码的格式一律不猜，交给服务端判 */
   const submit = () => {
+    /* 同步登录期间禁用重复提交（回车也会走到这里） */
+    if (busy) return
     setAcctErr('')
     setPwErr('')
     if (!acct.trim()) {
@@ -119,7 +121,7 @@ export default function AddAccountForm({ edit, busy, onSubmit, onClose }: Props)
             class="input input-sm w-full"
             type="text"
             maxlength={12}
-            placeholder="留空则用完整账号作 Tab 名"
+            placeholder="留空则由服务端自动填写"
             value={alias}
             onInput={(e: Event) => setAlias((e.target as HTMLInputElement).value)}
             onKeyDown={(e: KeyboardEvent) => {
@@ -130,7 +132,7 @@ export default function AddAccountForm({ edit, busy, onSubmit, onClose }: Props)
       </div>
 
       <div class="modal-action mt-0">
-        <button type="button" class="btn btn-sm" onClick={onClose}>
+        <button type="button" class="btn btn-sm" disabled={busy} onClick={onClose}>
           取消
         </button>
         <button type="button" class="btn btn-neutral btn-sm" disabled={busy} onClick={submit}>

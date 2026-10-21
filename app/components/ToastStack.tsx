@@ -1,10 +1,7 @@
+import type { ToastItem } from '../lib/types'
 import { HeroIcon, HERO_X_MARK } from './icons'
 
-export interface ToastItem {
-  id: number
-  msg: string
-  code?: string
-}
+export type { ToastItem } from '../lib/types'
 
 interface Props {
   toasts: ToastItem[]

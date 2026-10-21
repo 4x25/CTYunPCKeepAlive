@@ -1,27 +1,61 @@
-import { useState } from 'hono/jsx'
-import type { PointTask } from '../lib/types'
-import { TASK_TOTAL } from '../lib/mock-data'
+import { useEffect, useState } from 'hono/jsx'
+import type { Account, PointTask } from '../lib/types'
+import {
+  pointsDetail,
+  pointsText,
+  pointsTotal,
+  rewardOf,
+  taskDoneLabel,
+  taskProgressRatio,
+  taskProgressText,
+  taskStatusBadge,
+  todayDone,
+} from '../lib/derive'
+import { formatHm } from '../../shared/utils'
 import HelpMark from './HelpMark'
 
 function StatusBadge({ task }: { task: PointTask }) {
-  /* 交互稿里「执行中」与「已完成」同色（绿），「未完成」灰 */
-  if (task.status === 'done') return <span class="badge badge-soft badge-success badge-sm font-mono">已完成</span>
-  if (task.status === 'running') return <span class="badge badge-soft badge-success badge-sm font-mono">执行中</span>
-  return <span class="badge badge-soft badge-neutral badge-sm font-mono">未完成</span>
+  const badge = taskStatusBadge(task)
+  return <span class={`badge badge-soft badge-sm font-mono ${badge.cls}`}>{badge.label}</span>
 }
 
 interface Props {
-  tasks: PointTask[]
-  /** 「连接满 1 小时」的接口累计秒数：与被占用实例的倒计时同源 */
-  linkDone: number | null
-  onRunTask: (i: number) => void
-  onToggleTask: (i: number, on: boolean) => void
+  account: Account
+  /** 「刷新任务」单飞在途 */
+  refreshing: boolean
+  /** 任务执行与自动开关共用的在途状态，键为 `userId:taskDefId` */
+  busyTask: Readonly<Record<string, boolean>>
+  onRunTask: (taskDefId: number) => void
+  onToggleTask: (taskDefId: number, on: boolean) => void
+  onWindowCommit: (winStart: string, winEnd: string) => Promise<boolean>
+  onRefresh: () => void
 }
 
 /** 积分任务面板：执行时间窗口 + 积分概览 + 任务列表 */
-export default function PointsPanel({ tasks, linkDone, onRunTask, onToggleTask }: Props) {
-  const [winStart, setWinStart] = useState('09:00')
-  const [winEnd, setWinEnd] = useState('11:30')
+export default function PointsPanel(props: Props) {
+  const { account } = props
+  const [winStart, setWinStart] = useState(account.pointsWindow.winStart)
+  const [winEnd, setWinEnd] = useState(account.pointsWindow.winEnd)
+
+  /* 服务端窗口变化（操作响应 / 快照校正）时同步输入框 */
+  useEffect(() => {
+    setWinStart(account.pointsWindow.winStart)
+    setWinEnd(account.pointsWindow.winEnd)
+  }, [account.pointsWindow.winStart, account.pointsWindow.winEnd])
+
+  const commitWindow = async () => {
+    if (winStart !== account.pointsWindow.winStart || winEnd !== account.pointsWindow.winEnd) {
+      const ok = await props.onWindowCommit(winStart, winEnd)
+      if (!ok) {
+        setWinStart(account.pointsWindow.winStart)
+        setWinEnd(account.pointsWindow.winEnd)
+      }
+    }
+  }
+
+  const tasks = account.tasks
+  const done = todayDone(tasks)
+  const points = pointsTotal(account.points)
 
   return (
     <div role="tabpanel" aria-label="积分任务" class="flex h-full min-h-0 flex-col">
@@ -34,6 +68,7 @@ export default function PointsPanel({ tasks, linkDone, onRunTask, onToggleTask }
             aria-label="窗口开始时间"
             value={winStart}
             onInput={(e: Event) => setWinStart((e.target as HTMLInputElement).value)}
+            onBlur={commitWindow}
           />
           <span class="font-mono text-xs text-base-content/60">～</span>
           <input
@@ -42,15 +77,19 @@ export default function PointsPanel({ tasks, linkDone, onRunTask, onToggleTask }
             aria-label="窗口结束时间"
             value={winEnd}
             onInput={(e: Event) => setWinEnd((e.target as HTMLInputElement).value)}
+            onBlur={commitWindow}
           />
           <HelpMark
             label="执行时间说明"
-            tip="每天在这个窗口内随机取一个起跑时刻，跑完一轮就结束；窗口只约束起跑时间，「连接满 1 小时」允许跑到窗口之外。"
+            tip="每天在这个窗口内随机取一个起跑时刻，跑完一轮就结束；窗口只约束起跑时间。「使用1小时」等时长类任务本期不自动执行，需要手动点「执行」。"
           />
         </div>
         <div class="flex items-center gap-2.5">
-          <span class="font-mono text-xs text-base-content/60">更新于 09:41</span>
-          <button type="button" class="btn btn-xs">
+          <span class="font-mono text-xs text-base-content/60">
+            更新于 {account.points.updatedDate ? formatHm(account.points.updatedDate) : '—'}
+          </span>
+          <button type="button" class="btn btn-xs" disabled={props.refreshing} onClick={props.onRefresh}>
+            {props.refreshing && <span class="loading loading-spinner loading-xs" aria-hidden="true" />}
             刷新任务
           </button>
         </div>
@@ -59,14 +98,19 @@ export default function PointsPanel({ tasks, linkDone, onRunTask, onToggleTask }
       <div class="flex flex-wrap items-baseline gap-8 px-2 pb-3.5">
         <div>
           <p class="font-mono text-xs text-base-content/60">当前积分（示例）</p>
-          <div class="font-mono text-4xl font-semibold tabular-nums tracking-tight">1,280</div>
+          <div class="font-mono text-4xl font-semibold tabular-nums tracking-tight">{pointsText(points)}</div>
+          {account.points.pointsList.length > 0 && (
+            <p class="mt-1 font-mono text-[11px] text-base-content/50">{pointsDetail(account.points)}</p>
+          )}
         </div>
         <div class="min-w-40 flex-1 basis-44">
           <div class="mb-1.5 flex items-center justify-between">
             <span class="font-mono text-xs text-base-content/60">今日任务完成度</span>
-            <span class="font-mono text-xs tabular-nums text-base-content/60">1 / 3</span>
+            <span class="font-mono text-xs tabular-nums text-base-content/60">
+              {done.done} / {done.total}
+            </span>
           </div>
-          <progress class="progress progress-success h-1.5 w-full" value="33" max="100" />
+          <progress class="progress progress-success h-1.5 w-full" value={Math.round(done.ratio * 100)} max="100" />
         </div>
       </div>
 
@@ -84,41 +128,48 @@ export default function PointsPanel({ tasks, linkDone, onRunTask, onToggleTask }
             </tr>
           </thead>
           <tbody>
-            {tasks.map((t, i) => {
-              /* 1 小时任务：进度列显示接口累计值 total - 剩余，与实例倒计时同源 */
-              const bound = t.progressText == null
-              const done = linkDone ?? 1452
-              const text = bound ? `${Math.floor(done / 60)} / ${TASK_TOTAL / 60} 分钟` : t.progressText
-              const ratio = bound ? done / TASK_TOTAL : (t.ratio ?? 0)
+            {tasks.map((task) => {
+              const key = `${account.userId}:${task.taskDefId}`
+              const busy = task.busy || !!props.busyTask[key]
+              const disabled = task.status !== 0 || busy
+              const autoBusy = busy
               return (
-                <tr key={t.name} class="row-hover">
-                  <td class="text-[13px] font-semibold">{t.name}</td>
-                  <td class="font-mono tabular-nums">+{t.reward}</td>
-                  <td class="min-w-28" title={t.progressTip}>
-                    <span class="block font-mono text-[11.5px] tabular-nums whitespace-nowrap text-base-content/60">{text}</span>
-                    <progress class="progress mt-1 h-[3px] w-full" value={Math.round(ratio * 100)} max="100" />
+                <tr key={task.taskDefId} class="row-hover">
+                  <td class="text-[13px] font-semibold">{task.taskDefName}</td>
+                  <td class="font-mono tabular-nums">+{rewardOf(task)}</td>
+                  <td class="min-w-28" title={task.isDisplayProgress ? undefined : '该任务不展示进度'}>
+                    <span class="block font-mono text-[11.5px] tabular-nums whitespace-nowrap text-base-content/60">
+                      {taskProgressText(task)}
+                    </span>
+                    <progress
+                      class="progress mt-1 h-[3px] w-full"
+                      value={Math.round(taskProgressRatio(task) * 100)}
+                      max="100"
+                    />
                   </td>
                   <td>
-                    <StatusBadge task={t} />
+                    <StatusBadge task={task} />
                   </td>
                   <td class="w-20">
                     <button
                       type="button"
                       class="btn btn-xs"
-                      disabled={t.status !== 'idle' || t.busy}
-                      title={t.status === 'done' ? t.doneLabel || undefined : undefined}
-                      onClick={() => onRunTask(i)}
+                      disabled={disabled}
+                      title={task.status === 2 ? taskDoneLabel(task) : undefined}
+                      onClick={() => props.onRunTask(task.taskDefId)}
                     >
-                      {t.busy ? '执行中…' : t.status === 'running' ? '执行中' : '执行'}
+                      {busy ? '执行中…' : task.status === 1 ? '执行中' : '执行'}
                     </button>
                   </td>
                   <th class="w-14 font-normal">
                     <input
                       type="checkbox"
                       class="toggle toggle-sm"
-                      checked={t.auto}
-                      aria-label={`自动执行 ${t.name}`}
-                      onChange={(e: Event) => onToggleTask(i, (e.target as HTMLInputElement).checked)}
+                      checked={task.auto}
+                      disabled={autoBusy}
+                      title={autoBusy ? '该任务有操作正在进行…' : undefined}
+                      aria-label={`自动执行 ${task.taskDefName}`}
+                      onChange={(e: Event) => props.onToggleTask(task.taskDefId, (e.target as HTMLInputElement).checked)}
                     />
                   </th>
                 </tr>

@@ -1,5 +1,6 @@
-import { useState } from 'hono/jsx'
+import { useEffect, useState } from 'hono/jsx'
 import type { Account, PcInstance } from '../lib/types'
+import { lastCell, pcsEmptyText, refreshedLabel } from '../lib/derive'
 import StatusPill from './StatusPill'
 import HelpMark from './HelpMark'
 import Countdown from './Countdown'
@@ -18,7 +19,7 @@ const BLOCK_CD: Partial<Record<PcInstance['run'], string>> = {
   stopping: '关机中 · 不保活',
 }
 
-/** 「下次保活 / 最近」单元格第一行：执行中优先，其次禁用原因，再次会话冲突，最后倒计时 */
+/** 「下次保活 / 最近」单元格：第一行倒计时，第二行 lastAt + lastMsg 摘要 */
 function CdCell({ p }: { p: PcInstance }) {
   let first
   if (p.link != null)
@@ -28,21 +29,26 @@ function CdCell({ p }: { p: PcInstance }) {
       </>
     )
   else if (BLOCK_CD[p.run]) first = BLOCK_CD[p.run]
-  else if (p.conflict) first = <span class="badge badge-soft badge-warning badge-sm font-mono">会话冲突</span>
-  else
-    first =
-      p.auto && p.left != null ? (
-        <>
-          <Countdown seconds={p.left} /> 后
-        </>
-      ) : (
-        '—'
-      )
+  else if (p.auto && p.left != null)
+    first = (
+      <>
+        <Countdown seconds={p.left} /> 后
+      </>
+    )
+  else first = '—'
+
+  const last = lastCell(p)
   return (
     <span class="font-mono text-xs text-base-content/60 tabular-nums">
       {first}
       <br />
-      {p.last}
+      {last.summary ? (
+        <span title={last.title ?? undefined}>
+          {last.at} {last.summary}
+        </span>
+      ) : (
+        last.at
+      )}
     </span>
   )
 }
@@ -51,10 +57,14 @@ interface Props {
   account: Account
   refreshing: boolean
   refreshedAt: string
-  onIntervalCommit: (minutes: number) => void
+  /** 前端短态：成功胶囊 2 秒 */
+  justOkPc: Readonly<Record<string, boolean>>
+  /** 手动保活与自动开关共用的在途状态（键为 `userId:desktopId`），请求期间一并 disabled */
+  busyDesktop: Readonly<Record<string, boolean>>
+  onIntervalCommit: (minutes: number) => Promise<boolean>
   onRefresh: () => void
-  onManualKeepalive: (pcIndex: number) => void
-  onToggleAuto: (pcIndex: number, on: boolean) => void
+  onManualKeepalive: (desktopId: string) => void
+  onToggleAuto: (desktopId: string, on: boolean) => void
 }
 
 /** 保活面板：设置行 + 云电脑列表 */
@@ -62,13 +72,21 @@ export default function KeepAlivePanel(props: Props) {
   const { account: a } = props
   const [draft, setDraft] = useState(() => String(a.interval))
 
+  /* 服务端 interval 变化（操作响应 / 快照校正）时同步输入框 */
+  useEffect(() => {
+    setDraft(String(a.interval))
+  }, [a.interval])
+
   /* 保活间隔：失焦/回车时校验并重排倒计时；可填 1–59，非法输入回落到当前值 */
-  const commit = () => {
+  const commit = async () => {
     let v = parseInt(draft, 10)
     if (isNaN(v)) v = a.interval
     v = Math.max(1, Math.min(59, v))
     setDraft(String(v))
-    if (v !== a.interval) props.onIntervalCommit(v)
+    if (v !== a.interval) {
+      const ok = await props.onIntervalCommit(v)
+      if (!ok) setDraft(String(a.interval))
+    }
   }
 
   return (
@@ -98,9 +116,14 @@ export default function KeepAlivePanel(props: Props) {
             label="保活间隔说明"
             tip="可填 1–59。官方空闲回收时长为 60 分钟，默认 19 分钟，留足重试与网络波动的余量。修改后立刻按新间隔重排该账号所有计划。"
           />
+          {!a.eaichat.ok && (
+            <span class="badge badge-soft badge-warning badge-sm" title={a.eaichat.msg ?? undefined}>
+              云智助手会话不可用
+            </span>
+          )}
         </div>
         <div class="flex items-center gap-2.5">
-          <span class="font-mono text-xs text-base-content/60">更新于 {props.refreshedAt}</span>
+          <span class="font-mono text-xs text-base-content/60">更新于 {refreshedLabel(props.refreshedAt)}</span>
           <button
             type="button"
             class="btn btn-ghost btn-xs btn-square"
@@ -119,7 +142,7 @@ export default function KeepAlivePanel(props: Props) {
       </div>
 
       {!a.pcs.length ? (
-        <div class="grid flex-1 place-items-center text-[13px] text-base-content/60">{a.emptyText || '暂时无法获取云电脑列表'}</div>
+        <div class="grid flex-1 place-items-center text-[13px] text-base-content/60">{pcsEmptyText(a)}</div>
       ) : (
         <div class="min-h-0 flex-1 overflow-auto">
           <table class="table table-sm table-pin-cols table-pin-rows whitespace-nowrap">
@@ -135,16 +158,20 @@ export default function KeepAlivePanel(props: Props) {
               </tr>
             </thead>
             <tbody>
-              {a.pcs.map((p, i) => {
+              {a.pcs.map((p) => {
                 const blocked = !!BLOCK[p.run]
                 const tip = blocked ? BLOCK[p.run] : undefined
+                const key = `${a.userId}:${p.desktopId}`
+                const busy = !!props.busyDesktop[key]
+                const justOk = !!props.justOkPc[key]
+                const autoBusy = busy
                 return (
-                  <tr key={p.id} class="row-hover">
+                  <tr key={p.desktopId} class="row-hover">
                     <td>
-                      <div class="text-[13px] font-semibold">{p.name}</div>
-                      <div class="font-mono text-[11.5px] text-base-content/60">{p.id}</div>
+                      <div class="text-[13px] font-semibold">{p.desktopName}</div>
+                      <div class="font-mono text-[11.5px] text-base-content/60">{p.desktopId}</div>
                     </td>
-                    <td class="font-mono text-xs text-base-content/60">{p.os}</td>
+                    <td class="font-mono text-xs text-base-content/60">{p.osType}</td>
                     <td>
                       <StatusPill run={p.run} />
                     </td>
@@ -152,7 +179,7 @@ export default function KeepAlivePanel(props: Props) {
                       <CdCell p={p} />
                     </td>
                     <td class="w-20" title={tip}>
-                      {p.justOk ? (
+                      {justOk ? (
                         <span class="badge badge-soft badge-success badge-sm">
                           <HeroIcon icon={HERO_CHECK} class="h-3 w-3" />
                           成功
@@ -161,21 +188,22 @@ export default function KeepAlivePanel(props: Props) {
                         <button
                           type="button"
                           class="btn btn-xs"
-                          disabled={blocked || p.busy || p.link != null}
-                          onClick={() => props.onManualKeepalive(i)}
+                          disabled={blocked || busy || p.link != null}
+                          onClick={() => props.onManualKeepalive(p.desktopId)}
                         >
-                          {p.busy || p.link != null ? '执行中' : '保活'}
+                          {busy || p.link != null ? '执行中' : '保活'}
                         </button>
                       )}
                     </td>
-                    <th class="w-14 font-normal" title={tip}>
+                    <th class="w-14 font-normal" title={blocked && !p.auto ? tip : autoBusy ? '该实例有操作正在进行…' : undefined}>
                       <input
                         type="checkbox"
                         class="toggle toggle-sm"
                         checked={p.auto}
-                        disabled={blocked}
-                        aria-label={`自动保活 ${p.name}`}
-                        onChange={(e: Event) => props.onToggleAuto(i, (e.target as HTMLInputElement).checked)}
+                        /* 仅“打开”会被实例状态拦住；关闭永远允许 */
+                        disabled={autoBusy || (blocked && !p.auto)}
+                        aria-label={`自动保活 ${p.desktopName}`}
+                        onChange={(e: Event) => props.onToggleAuto(p.desktopId, (e.target as HTMLInputElement).checked)}
                       />
                     </th>
                   </tr>

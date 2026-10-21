@@ -1,4 +1,5 @@
 import type { LogEntry, LogLevel } from '../lib/types'
+import { logTime } from '../lib/derive'
 
 const LV_CLS: Record<LogLevel, string> = {
   DEBUG: 'text-base-content/50',
@@ -10,6 +11,8 @@ const LV_CLS: Record<LogLevel, string> = {
 interface Props {
   rows: LogEntry[]
   total: number
+  /** 首次请求 / 筛选重拉在途：显示 loading，不显示「还没有日志」 */
+  loading: boolean
   /** 「主号 138****6021」 */
   accountLabel: string
   lv: string
@@ -30,6 +33,7 @@ interface Props {
 /** 日志面板：级别 / 模块 / 关键字三个条件可叠加，按账号归属渲染 */
 export default function LogPanel(props: Props) {
   const { rows, total } = props
+  const filtering = props.lv !== 'ALL' || props.mod !== 'ALL' || !!props.kw.trim() || props.includeSys
   return (
     <div role="tabpanel" aria-label="运行日志" class="flex h-full min-h-0 flex-col">
       <div class="mb-2.5 flex flex-wrap items-center gap-2.5">
@@ -86,16 +90,23 @@ export default function LogPanel(props: Props) {
       </div>
 
       <div class="min-h-0 flex-1 overflow-y-auto border-y border-base-300">
-        {!rows.length ? (
+        {!rows.length && props.loading ? (
+          <div class="flex items-center justify-center gap-2 py-7 text-[13px] text-base-content/60" role="status">
+            <span class="loading loading-spinner loading-sm" aria-hidden="true" />
+            正在加载日志…
+          </div>
+        ) : !rows.length ? (
           <div class="py-7 text-center text-[13px] text-base-content/60">
-            {total ? '当前筛选条件下没有日志' : '这个账号还没有日志'}
+            {filtering ? '当前筛选条件下没有日志' : '这个账号还没有日志'}
           </div>
         ) : (
           <table class="table table-xs">
             <tbody>
               {rows.map((r) => (
                 <tr key={r.seq}>
-                  <td class="w-20 font-mono text-[11.5px] text-base-content/60 tabular-nums">{r.t}</td>
+                  <td class="w-20 font-mono text-[11.5px] text-base-content/60 tabular-nums" title={r.t}>
+                    {logTime(r.t)}
+                  </td>
                   <td class={`w-14 font-mono text-[11.5px] font-semibold ${LV_CLS[r.lv]}`}>{r.lv}</td>
                   <td class="w-20 font-mono text-[11.5px] text-base-content/60">{r.mod}</td>
                   <td class="font-mono text-[11.5px] break-words">{r.msg}</td>

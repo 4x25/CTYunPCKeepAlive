@@ -1,6 +1,6 @@
 import { Fragment, type Child } from 'hono/jsx'
 import type { Account, DotTone } from '../lib/types'
-import { MAX_ACCOUNTS } from '../lib/mock-data'
+import { tabLabel, tabTitle } from '../lib/derive'
 import ThemeToggle from './ThemeToggle'
 import { GithubIcon, HeroIcon, HERO_PLUS, HERO_X_MARK } from './icons'
 
@@ -12,21 +12,15 @@ const DOT: Record<DotTone, string> = {
   load: 'status status-neutral animate-pulse',
 }
 
-/* Tab 名：填了别名只显示别名，留空就显示完整账号；完整值靠 hover 的 title 补全 */
-function tabLabel(a: Account): string {
-  return a.alias || a.full
-}
-function tabTitle(a: Account): string {
-  return `完整账号：${a.full}\n别名：${a.alias || '未设置（Tab 名直接用完整账号）'}`
-}
-
 interface Props {
   accounts: Account[]
   active: number
+  /** 账号上限来自 GET /state 的 maxAccounts */
+  maxAccounts: number
   /** 每个账号各自的页签内容（保活/积分/日志面板或错误面板），全部挂载 */
   renderContent: (account: Account, index: number) => Child
-  onSelect: (i: number) => void
-  onDelete: (i: number) => void
+  onSelect: (userId: number) => void
+  onDelete: (userId: number) => void
   onAdd: () => void
 }
 
@@ -42,25 +36,25 @@ interface Props {
  * （官方示例内容是纯文本短句，不触发；此处用 contain 把固有宽度贡献归零，同时
  * max-w 把使用宽度截在滚动视口内）。
  */
-export default function AccountTabBar({ accounts, active, renderContent, onSelect, onDelete, onAdd }: Props) {
-  const atMax = accounts.length >= MAX_ACCOUNTS
+export default function AccountTabBar({ accounts, active, maxAccounts, renderContent, onSelect, onDelete, onAdd }: Props) {
+  const atMax = accounts.length >= maxAccounts
   return (
     <div class={accounts.length > 0 ? 'min-h-0 flex-1 overflow-x-auto' : 'overflow-x-auto'}>
       <div class="tabs tabs-lift h-full min-w-max" aria-label="账号列表">
         {accounts.map((a, i) => (
-          <Fragment key={String(a.uid)}>
+          <Fragment key={String(a.userId)}>
             <label class="tab group z-1 gap-1.5 whitespace-nowrap [--tab-bg:var(--color-base-200)]" title={tabTitle(a)}>
               <input
                 type="radio"
                 name="acct-tabs"
                 aria-label={tabLabel(a)}
                 checked={i === active}
-                onChange={() => onSelect(i)}
+                onChange={() => onSelect(a.userId)}
                 onKeyDown={(e: KeyboardEvent) => {
                   /* 键盘用 Delete 关闭当前 Tab——可关闭 Tab 的标准做法 */
                   if (e.key === 'Delete') {
                     e.preventDefault()
-                    onDelete(i)
+                    onDelete(a.userId)
                   }
                 }}
               />
@@ -75,7 +69,7 @@ export default function AccountTabBar({ accounts, active, renderContent, onSelec
                   /* Tab 上的「×」走二次确认，不切换 Tab（preventDefault 阻止 label 激活 radio） */
                   e.preventDefault()
                   e.stopPropagation()
-                  onDelete(i)
+                  onDelete(a.userId)
                 }}
               >
                 <HeroIcon icon={HERO_X_MARK} class="h-3 w-3" />
@@ -97,7 +91,7 @@ export default function AccountTabBar({ accounts, active, renderContent, onSelec
             class="btn btn-ghost btn-sm btn-square"
             aria-label="新增账号"
             disabled={atMax}
-            title={atMax ? `最多 ${MAX_ACCOUNTS} 个账号，避免并发请求过密` : '新增账号'}
+            title={atMax ? `最多 ${maxAccounts} 个账号，避免并发请求过密` : '新增账号'}
             onClick={onAdd}
           >
             <HeroIcon icon={HERO_PLUS} class="h-4 w-4" />

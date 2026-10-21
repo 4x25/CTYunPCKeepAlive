@@ -1,17 +1,19 @@
+import dayjs from 'dayjs/esm'
 import { useEffect, useRef, useState } from 'hono/jsx'
-import type { Account, LogLevel, PcInstance, PointTask } from '../lib/types'
-import type { LogEntry } from '../lib/types'
-import {
-  MAX_ACCOUNTS,
-  TASK_TOTAL,
-  demoPcs,
-  demoUid,
-  nextSeq,
-  seedAccounts,
-  seedPointTasks,
-  seedSyslogs,
-} from '../lib/mock-data'
-import { maskOf, nowHm, nowStr } from '../lib/utils'
+import { ErrorCode } from '../../shared/constants'
+import type {
+  Account,
+  LogFilters,
+  LogLevel,
+  LogModule,
+  LogView,
+  StateSnapshot,
+  ToastItem,
+  Dlg,
+} from '../lib/types'
+import { api, isApiError, isTimeout } from '../lib/api'
+import { accountFileSlug, accountLabel } from '../lib/derive'
+import { clockOffsetOf, hasStoppedCountdown, hasTransitionalRun, nowWithOffset, projectCountdowns } from '../lib/time'
 import AccountTabBar from '../components/AccountTabBar'
 import AccountErrorPanel from '../components/AccountErrorPanel'
 import EmptyAccountPanel from '../components/EmptyAccountPanel'
@@ -20,156 +22,389 @@ import KeepAlivePanel from '../components/KeepAlivePanel'
 import PointsPanel from '../components/PointsPanel'
 import LogPanel from '../components/LogPanel'
 import ModalLayer from '../components/ModalLayer'
+import ToastStack from '../components/ToastStack'
 import AddAccountForm, { type AddFormValues } from '../components/AddAccountForm'
 import DeleteConfirm from '../components/DeleteConfirm'
-import type { ToastItem } from '../components/ToastStack'
 
-type Dlg = { kind: 'add'; edit: number } | { kind: 'del'; index: number } | null
+const EMPTY_LOG_VIEW: LogView = { rows: [], total: 0, loading: true }
 
-/* 页面级状态快照的轻量深拷贝：日志条目等叶子对象只读不原地改，浅拷即可 */
-const cloneAccounts = (prev: Account[]): Account[] =>
-  prev.map((a) => ({ ...a, pcs: a.pcs.map((p) => ({ ...p })), logs: [...a.logs], banner: a.banner ? { ...a.banner } : null }))
+/** 删除墓碑 TTL：挡住删除前发出、删除后才到的旧快照，10s 后自动解除 */
+const TOMBSTONE_TTL_MS = 10_000
 
-/** 天翼云保活助手 · 交互原型（数据为演示 mock，行为对齐交互稿） */
+const withoutKey = <T,>(record: Record<string, T>, key: string): Record<string, T> => {
+  const next = { ...record }
+  delete next[key]
+  return next
+}
+
+/* 资源键：同一 userId 下 desktopId/taskDefId 可能重名，键一律带账号 */
+const desktopKey = (userId: number, desktopId: string) => `${userId}:${desktopId}`
+const taskKey = (userId: number, taskDefId: number) => `${userId}:${taskDefId}`
+
+/* 在途写操作的「操作敏感字段」占位键（frontend-design §2.3） */
+const desktopHold = (userId: number, desktopId: string) => `pc:${desktopKey(userId, desktopId)}`
+const accountHold = (userId: number) => `account:${userId}`
+const taskAutoHold = (userId: number, taskDefId: number) => `task-auto:${taskKey(userId, taskDefId)}`
+const taskRunHold = (userId: number, taskDefId: number) => `task-run:${taskKey(userId, taskDefId)}`
+
+interface PendingFetch {
+  minRevision?: number
+  silent: boolean
+  /** 快照 revision 不足时的重拉次数（最多 2 次，避免死循环） */
+  attempt: number
+}
+
+/**
+ * 天翼云保活助手：唯一 island，状态编排 + 组件装配。
+ * 数据来源统一经 app/lib/api.ts（VITE_USE_MOCK=1 时走 api-mock）。
+ */
 export default function KeepAliveApp() {
-  const [accounts, setAccounts] = useState<Account[]>(seedAccounts)
-  const [syslogs, setSyslogs] = useState<LogEntry[]>(seedSyslogs)
-  const [tasks, setTasks] = useState<PointTask[]>(seedPointTasks)
-  /* 初始态从 SSR 已勾选的 radio 读回：水合前用户就能用纯 CSS 切 Tab，水合不翻回 */
-  const [active, setActive] = useState(() => {
-    if (typeof document === 'undefined') return 0
-    const i = Array.from(document.querySelectorAll<HTMLInputElement>('input[name="acct-tabs"]')).findIndex((r) => r.checked)
-    return i >= 0 ? i : 0
-  })
-  const [tab, setTab] = useState<TabKey>(() => {
-    if (typeof document === 'undefined') return 'keepalive'
-    const checked = document.querySelector<HTMLInputElement>('input[name^="sub-tabs-"]:checked')
-    const label = checked?.getAttribute('aria-label')
-    return label === '积分任务' ? 'points' : label === '运行日志' ? 'log' : 'keepalive'
-  })
+  const [ready, setReady] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [accounts, setAccounts] = useState<Account[]>([])
+  const [maxAccounts, setMaxAccounts] = useState(0)
+  const [refreshedAt, setRefreshedAt] = useState('')
+  const [activeUid, setActiveUid] = useState<number | null>(null)
+  const [tab, setTab] = useState<TabKey>('keepalive')
   const [dlg, setDlg] = useState<Dlg>(null)
   const [addBusy, setAddBusy] = useState(false)
+  const [delBusy, setDelBusy] = useState(false)
   const [toasts, setToasts] = useState<ToastItem[]>([])
-  const [refreshing, setRefreshing] = useState(false)
-  const [refreshedAt, setRefreshedAt] = useState('14:32')
+  const [session, setSession] = useState(0)
 
-  /* 日志筛选 */
+  /* 前端短态：手动保活 / 任务执行 / 开关在途，挂在 island，不进服务端模型 */
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshingPoints, setRefreshingPoints] = useState(false)
+  const [justOkPc, setJustOkPc] = useState<Record<string, boolean>>({})
+  /* busyDesktop / busyTask 是同一资源的唯一在途标记：手动保活与自动开关共用前者，任务执行与任务开关共用后者 */
+  const [busyDesktop, setBusyDesktop] = useState<Record<string, boolean>>({})
+  const [busyTask, setBusyTask] = useState<Record<string, boolean>>({})
+
+  /* 日志：每账号一份视图缓存，唯一数据源是 4.13 */
+  const [logViews, setLogViews] = useState<Record<number, LogView>>({})
   const [lv, setLv] = useState('ALL')
   const [mod, setMod] = useState('ALL')
   const [kw, setKw] = useState('')
   const [includeSys, setIncludeSys] = useState(false)
   const [autoScroll, setAutoScroll] = useState(true)
-  const [clearArmed, setClearArmed] = useState(false)
+  const [clearArmed, setClearArmed] = useState<Record<number, boolean>>({})
 
   /* 供定时器 / 延时回调读到最新值 */
   const accountsRef = useRef(accounts)
   accountsRef.current = accounts
-  const activeRef = useRef(active)
-  activeRef.current = active
-  const refreshingRef = useRef(false)
-  const lastRefreshRef = useRef(Date.now())
-  const clearArmedAtRef = useRef(0)
-  const toastIdRef = useRef(0)
+  const activeUidRef = useRef(activeUid)
+  activeUidRef.current = activeUid
+  const filterRef = useRef<LogFilters>({ lv, mod, kw, includeSys })
+  filterRef.current = { lv, mod, kw, includeSys }
 
-  /* ── 日志：所有操作都往这里写一条 ─────────────────────────────
-     idx 省略 = 记到当前账号；显式传 null = 无账号归属（删除账号这类事件） */
-  const addLog = (level: LogLevel, module: string, msg: string, idx?: number | null) => {
-    const entry: LogEntry = { seq: nextSeq(), t: nowStr(), lv: level, mod: module, msg }
-    if (idx === null) {
-      setSyslogs((prev) => [entry, ...prev])
-      return
+  const revisionRef = useRef(0)
+  const loadedRef = useRef(false)
+  const clockOffsetRef = useRef(0)
+  const snapshotInFlightRef = useRef(false)
+  const pendingFetchRef = useRef<PendingFetch | null>(null)
+  const lastStateAtRef = useRef(0)
+  const refreshingRef = useRef(false)
+  const pointsRefreshingRef = useRef(false)
+  const clearArmedAtRef = useRef<Record<number, number>>({})
+  const toastIdRef = useRef(0)
+  const zeroSinceRef = useRef<number | null>(null)
+  const logGenerationRef = useRef(0)
+
+  /* 乱序/并发防护：在途写操作占位、已删除账号墓碑、在途互斥集合 */
+  const inFlightRef = useRef<Set<string>>(new Set())
+  /** userId → 墓碑到期时间戳（TTL 10s，见 TOMBSTONE_TTL_MS） */
+  const tombstonesRef = useRef<Map<number, number>>(new Map())
+  /* 手动保活的同步 ref 闸门：React 状态尚未刷新时也能挡住极快双击 */
+  const manualKeepaliveRef = useRef<Set<string>>(new Set())
+  const busyDesktopRef = useRef<Set<string>>(new Set())
+  const busyTaskRef = useRef<Set<string>>(new Set())
+  /** 同账号设置写操作串行队列：Enter + blur 等重复提交也不会并发或互相回滚 */
+  const settingsQueueRef = useRef<Map<number, Promise<unknown>>>(new Map())
+
+  const isTombstoned = (userId: number): boolean => {
+    const expiresAt = tombstonesRef.current.get(userId)
+    if (expiresAt == null) return false
+    if (Date.now() >= expiresAt) {
+      tombstonesRef.current.delete(userId)
+      return false
     }
-    const i = idx ?? activeRef.current
-    setAccounts((prev) => {
-      const next = cloneAccounts(prev)
-      next[i]?.logs.unshift(entry)
-      return next
-    })
+    return true
+  }
+  const addTombstone = (userId: number) => {
+    tombstonesRef.current.set(userId, Date.now() + TOMBSTONE_TTL_MS)
+  }
+  const clearTombstone = (userId: number) => {
+    tombstonesRef.current.delete(userId)
   }
 
-  /* ── Toast：服务端报错的唯一出口，6 秒自动消失 ─────────────── */
-  const pushToast = (msg: string, code?: string) => {
+  /** 同账号设置写操作（interval / pointsWindow）互斥：拿不到占位就不发请求 */
+  function acquireAccountHold(userId: number): boolean {
+    const hold = accountHold(userId)
+    if (inFlightRef.current.has(hold)) return false
+    inFlightRef.current.add(hold)
+    return true
+  }
+  function releaseAccountHold(userId: number) {
+    inFlightRef.current.delete(accountHold(userId))
+  }
+
+  /**
+   * 同一账号的 interval / pointsWindow 提交串行化：
+   * 前一个请求（含超时）结束后才发下一个，避免 Enter + blur 触发两个并发写。
+   */
+  function queueAccountSettings<T>(userId: number, run: () => Promise<T>): Promise<T> {
+    const previous = settingsQueueRef.current.get(userId) ?? Promise.resolve()
+    const next = previous.then(run, run)
+    settingsQueueRef.current.set(userId, next)
+    const cleanup = () => {
+      if (settingsQueueRef.current.get(userId) === next) settingsQueueRef.current.delete(userId)
+    }
+    void next.then(cleanup, cleanup)
+    return next
+  }
+
+  /* ── Toast：服务端报错的唯一出口，6 秒自动消失 ───────────── */
+  function pushToast(msg: string, code?: string) {
     const id = ++toastIdRef.current
     setToasts((prev) => [...prev, { id, msg, code }])
-    setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 6000)
+    setTimeout(() => setToasts((prev) => prev.filter((item) => item.id !== id)), 6000)
   }
-  const dismissToast = (id: number) => setToasts((prev) => prev.filter((t) => t.id !== id))
+  const dismissToast = (id: number) => setToasts((prev) => prev.filter((item) => item.id !== id))
 
-  /* ── 弹窗开关：上一次的服务端报错不带进这一次 ──────────────── */
-  const [session, setSession] = useState(0)
-  const openDlg = (next: Exclude<Dlg, null>) => {
-    setToasts([])
-    setAddBusy(false)
-    setSession((s) => s + 1) /* 递增 key，重置表单内部状态 */
-    setDlg(next)
-  }
-  /* 仅标记关闭：动画与焦点归还交给常驻 dialog 自己完成 */
-  const closeDlg = () => {
-    setDlg(null)
-  }
-  /* 关闭动画期间保留内容配置（表单不随 open 态消失，跟随弹窗一起淡出） */
-  const contentRef = useRef<Dlg>(null)
-  if (dlg) contentRef.current = dlg
-  const openAdd = (idx: number | null) => openDlg({ kind: 'add', edit: idx ?? -1 })
-  const openDel = (idx: number) => {
-    if (!accountsRef.current[idx]) return
-    openDlg({ kind: 'del', index: idx })
+  function toastError(error: unknown) {
+    if (isApiError(error)) {
+      pushToast(isTimeout(error) ? `${error.message}，已自动刷新状态` : error.message, `code=${error.code}`)
+    } else {
+      pushToast('网络异常，请稍后重试')
+    }
   }
 
-  /* ── 功能页签：记住上次停留的 Tab ─────────────────────────── */
-  const changeTab = (t: TabKey) => {
-    setTab(t)
+  /* 写操作失败一律追加一次 4.1 校正（banner/dot/列表以服务端为准） */
+  function handleError(error: unknown) {
+    toastError(error)
+    void fetchState(undefined, true)
   }
 
-  /* ── 每秒推进倒计时与 1 小时连接计时（所有账号的内容全部挂载，倒计时全量推进） ── */
+  /** 写操作响应落地：把 revision 水位抬到响应值，挡住更旧的快照 */
+  function noteRevision(revision: number) {
+    if (revision > revisionRef.current) revisionRef.current = revision
+  }
+
+  /* ── 日志拉取（仅当前激活账号、数据缺失或显式触发时） ─────── */
+  async function loadLogs(list: Account[], filters: LogFilters) {
+    if (!list.length) {
+      /* 让在途的旧响应失效 */
+      logGenerationRef.current += 1
+      return
+    }
+    const generation = ++logGenerationRef.current
+    const queries = list.map((account) => {
+      const query: Parameters<typeof api.queryLogs>[0] = {
+        userId: account.userId,
+        includeSys: filters.includeSys,
+        limit: 200,
+      }
+      if (filters.lv !== 'ALL') query.lv = filters.lv as LogLevel
+      if (filters.mod !== 'ALL') query.mod = filters.mod as LogModule
+      if (filters.kw.trim()) query.kw = filters.kw.trim()
+      return { userId: account.userId, promise: api.queryLogs(query) }
+    })
+
+    /* 首次/重拉都先进入 loading：面板据此显示 spinner 而不是「还没有日志」 */
+    setLogViews((prev) => {
+      const next = { ...prev }
+      for (const item of queries) {
+        next[item.userId] = { ...(prev[item.userId] ?? EMPTY_LOG_VIEW), loading: true }
+      }
+      return next
+    })
+
+    const settled = await Promise.allSettled(queries.map((item) => item.promise))
+    /* 过期响应直接丢弃（generation 机制保留） */
+    if (generation !== logGenerationRef.current) return
+
+    const updates: Record<number, LogView> = {}
+    const failed: number[] = []
+    let firstError: unknown
+    settled.forEach((outcome, index) => {
+      const userId = queries[index].userId
+      if (outcome.status === 'fulfilled') {
+        updates[userId] = { rows: outcome.value.rows, total: outcome.value.total, loading: false }
+      } else {
+        failed.push(userId)
+        if (firstError === undefined) firstError = outcome.reason
+      }
+    })
+    setLogViews((prev) => {
+      const next = { ...prev }
+      for (const [userId, view] of Object.entries(updates)) next[Number(userId)] = view
+      for (const userId of failed) {
+        next[userId] = { ...(prev[userId] ?? EMPTY_LOG_VIEW), loading: false }
+      }
+      return next
+    })
+    if (firstError !== undefined) toastError(firstError)
+  }
+
+  function loadLogsFor(userId: number) {
+    const account = accountsRef.current.find((item) => item.userId === userId)
+    if (account) void loadLogs([account], filterRef.current)
+  }
+
+  /**
+   * 账号新增/修正/删除后让日志缓存失效：
+   * 清掉受影响 userId 的视图 + 抬 generation（在途响应写不回来）；
+   * 当前在日志页签时立即重拉（显式传入重拉账号，避免等 accounts 状态落地）。
+   */
+  function invalidateLogViews(userIds: number[], reloadAccount?: Account | null) {
+    logGenerationRef.current += 1
+    setLogViews((prev) => {
+      const next = { ...prev }
+      for (const userId of userIds) delete next[userId]
+      return next
+    })
+    if (tab !== 'log') return
+    /* undefined = 未指定重拉账号，回落到当前激活账号；null = 明确不重拉（如删掉唯一账号） */
+    const account =
+      reloadAccount === undefined
+        ? (accountsRef.current.find((item) => item.userId === activeUidRef.current) ?? null)
+        : reloadAccount
+    if (account) void loadLogs([account], filterRef.current)
+  }
+
+  /* ── 快照应用（revision 乱序防护 + 在途敏感字段暂不应用） ── */
+  function mergeHeldAccount(account: Account): Account {
+    const prev = accountsRef.current.find((item) => item.userId === account.userId)
+    if (!prev) return account
+
+    let next = account
+    if (inFlightRef.current.has(accountHold(account.userId))) {
+      next = { ...next, interval: prev.interval }
+    }
+
+    if (next.pcs.some((pc) => inFlightRef.current.has(desktopHold(account.userId, pc.desktopId)))) {
+      next = {
+        ...next,
+        pcs: next.pcs.map((pc) => {
+          if (!inFlightRef.current.has(desktopHold(account.userId, pc.desktopId))) return pc
+          const old = prev.pcs.find((item) => item.desktopId === pc.desktopId)
+          return old ? { ...pc, auto: old.auto, left: old.left } : pc
+        }),
+      }
+    }
+
+    if (
+      next.tasks.some(
+        (task) =>
+          inFlightRef.current.has(taskAutoHold(account.userId, task.taskDefId)) ||
+          inFlightRef.current.has(taskRunHold(account.userId, task.taskDefId)),
+      )
+    ) {
+      next = {
+        ...next,
+        tasks: next.tasks.map((task) => {
+          const old = prev.tasks.find((item) => item.taskDefId === task.taskDefId)
+          if (!old) return task
+          let merged = task
+          if (inFlightRef.current.has(taskAutoHold(account.userId, task.taskDefId))) {
+            merged = { ...merged, auto: old.auto }
+          }
+          if (inFlightRef.current.has(taskRunHold(account.userId, task.taskDefId))) {
+            merged = { ...merged, status: old.status, busy: old.busy }
+          }
+          return merged
+        }),
+      }
+    }
+
+    return next
+  }
+
+  function applySnapshot(snapshot: StateSnapshot): boolean {
+    /* 只读已写入的 revision 水位：旧快照一律丢弃 */
+    if (snapshot.revision < revisionRef.current) return false
+    revisionRef.current = snapshot.revision
+
+    /* 墓碑 TTL 清扫：到期后自动解除，避免 map 无限增长 */
+    const now = Date.now()
+    for (const [userId, expiresAt] of tombstonesRef.current) {
+      if (now >= expiresAt) tombstonesRef.current.delete(userId)
+    }
+
+    clockOffsetRef.current = clockOffsetOf(snapshot.serverTime)
+
+    const nextAccounts = snapshot.accounts
+      .filter((account) => !isTombstoned(account.userId))
+      .map(mergeHeldAccount)
+
+    setAccounts(nextAccounts)
+    setMaxAccounts(snapshot.maxAccounts)
+    setRefreshedAt(snapshot.refreshedAt)
+    setActiveUid((prev) =>
+      prev != null && nextAccounts.some((account) => account.userId === prev)
+        ? prev
+        : (nextAccounts[0]?.userId ?? null),
+    )
+    loadedRef.current = true
+    setLoadError(null)
+    setReady(true)
+    return true
+  }
+
+  /**
+   * 拉全量快照；minRevision 用于写操作后的乱序防护（快照 revision 不足则重拉）。
+   * 在途时不丢弃请求：记录 pending，当前请求结束后补一次。
+   */
+  async function fetchState(minRevision?: number, silent = false, attempt = 0) {
+    if (snapshotInFlightRef.current) {
+      const pending = pendingFetchRef.current
+      pendingFetchRef.current = {
+        minRevision: Math.max(pending?.minRevision ?? 0, minRevision ?? 0) || undefined,
+        silent: pending ? pending.silent && silent : silent,
+        attempt: Math.max(pending?.attempt ?? 0, attempt),
+      }
+      return
+    }
+
+    snapshotInFlightRef.current = true
+    try {
+      const snapshot = await api.getState()
+      if (minRevision !== undefined && snapshot.revision < minRevision) {
+        if (attempt < 2) {
+          pendingFetchRef.current = { minRevision, silent: true, attempt: attempt + 1 }
+        }
+        return
+      }
+      if (applySnapshot(snapshot)) lastStateAtRef.current = Date.now()
+    } catch (error) {
+      if (loadedRef.current) {
+        if (!silent) toastError(error)
+      } else {
+        setLoadError(isApiError(error) ? error.message : '网络异常，请稍后重试')
+      }
+    } finally {
+      snapshotInFlightRef.current = false
+      const pending = pendingFetchRef.current
+      pendingFetchRef.current = null
+      if (pending) void fetchState(pending.minRevision, pending.silent, pending.attempt)
+    }
+  }
+
+  /** 可视刷新 / 切 Tab 的节流入口 */
+  function maybeFetchState(minGapMs: number) {
+    if (Date.now() - lastStateAtRef.current < minGapMs) return
+    void fetchState(undefined, true)
+  }
+
+  /* ── 首屏 / 可见性 / 过渡态 ───────────────────────────────── */
   useEffect(() => {
-    const id = setInterval(() => {
-      setAccounts((prev) => {
-        let touched = false
-        const next = prev.map((a) => {
-          let pcs: PcInstance[] | null = null
-          a.pcs.forEach((p, j) => {
-            /* 积分任务「连接满 1 小时」占用某台实例，与保活列表同源 */
-            if (p.link != null) {
-              pcs ||= a.pcs.map((x) => ({ ...x }))
-              const rest = p.link - 1
-              pcs[j].link = rest <= 0 ? TASK_TOTAL : rest
-            } else if (p.auto && p.run === 'running' && p.left != null) {
-              pcs ||= a.pcs.map((x) => ({ ...x }))
-              const rest = p.left - 1
-              pcs[j].left = rest <= 0 ? a.interval * 60 : rest
-              /* 会话冲突的实例：到点仍然会试，但演示里保持失败态，不抢回连接 */
-              if (rest <= 0 && !p.conflict) pcs[j].last = nowStr() + ' 成功'
-            }
-          })
-          if (!pcs) return a
-          touched = true
-          return { ...a, pcs }
-        })
-        return touched ? next : prev
-      })
-    }, 1000)
-    return () => clearInterval(id)
+    void fetchState()
   }, [])
 
-  /* ── 刷新列表：手动点击与「可视刷新」共用同一套节流逻辑 ────── */
-  const doRefresh = () => {
-    if (refreshingRef.current) return
-    refreshingRef.current = true
-    setRefreshing(true)
-    setTimeout(() => {
-      refreshingRef.current = false
-      lastRefreshRef.current = Date.now()
-      setRefreshing(false)
-      setRefreshedAt(nowHm())
-    }, 1000)
-  }
-  /* 可视刷新：重新拿到焦点且距上次成功刷新超过 60 秒，自动刷一次 */
   useEffect(() => {
     const maybeVisibleRefresh = () => {
       if (document.hidden || !document.hasFocus()) return
-      if (Date.now() - lastRefreshRef.current < 60000) return
-      doRefresh()
+      maybeFetchState(15_000)
     }
     document.addEventListener('visibilitychange', maybeVisibleRefresh)
     window.addEventListener('focus', maybeVisibleRefresh)
@@ -179,331 +414,560 @@ export default function KeepAliveApp() {
     }
   }, [])
 
-  /* ── 保活执行：按钮「执行中」→ 成功胶囊 2 秒 → 回落。手动点击与「打开开关立即执行一次」共用 ── */
-  const runKeepalive = (ai: number, pcIndex: number) => {
-    setAccounts((prev) => {
-      const next = cloneAccounts(prev)
-      const p = next[ai]?.pcs[pcIndex]
-      if (p) p.busy = true
-      return next
-    })
-    setTimeout(() => {
-      let ok = false
-      let name = ''
-      let auto = false
-      let left: number | null = null
-      setAccounts((prev) => {
-        const next = cloneAccounts(prev)
-        const a = next[ai]
-        const p = a?.pcs[pcIndex]
-        if (a && p) {
-          p.busy = false
-          p.justOk = true
-          p.last = nowStr() + ' 成功'
-          p.conflict = false /* 手动成功一次就说明会话拿回来了 */
-          if (p.auto) p.left = a.interval * 60
-          name = p.name
-          auto = p.auto
-          left = p.left
-          ok = true
-        }
-        return next
-      })
-      if (!ok) return
-      addLog('DEBUG', '保活', `${name} 界面状态已同步 · 自动保活：${auto ? '开启' : '关闭'} · 下次倒计时：${left == null ? '未安排' : left + ' 秒'}`, ai)
-      addLog('INFO', '保活', `${name} 保活成功 · 耗时 ${400 + Math.floor(Math.random() * 400)}ms`, ai)
-      setTimeout(() => {
-        setAccounts((prev) => {
-          const next = cloneAccounts(prev)
-          const p = next[ai]?.pcs[pcIndex]
-          if (p) p.justOk = false
-          return next
-        })
-      }, 2000)
-    }, 1100)
-  }
-
-  /* ── 自动开关：切换即落库；打开 = 立即执行一次，再开始按间隔计时 ── */
-  const onToggleAuto = (ai: number, pcIndex: number, on: boolean) => {
-    let name = ''
-    let interval = 19
-    let canRun = false
-    setAccounts((prev) => {
-      const next = cloneAccounts(prev)
-      const a = next[ai]
-      const p = a?.pcs[pcIndex]
-      if (a && p) {
-        p.auto = on
-        if (on && p.run === 'running') p.left = a.interval * 60
-        name = p.name
-        interval = a.interval
-        canRun = on && p.link == null && p.run === 'running'
+  /* 每秒推进倒计时：left 减到 0 停住；停 3s 未校正则主动拉一次 /state */
+  useEffect(() => {
+    const tick = setInterval(() => {
+      setAccounts((prev) => projectCountdowns(prev))
+    }, 1000)
+    const check = setInterval(() => {
+      if (!hasStoppedCountdown(accountsRef.current)) {
+        zeroSinceRef.current = null
+        return
       }
-      return next
-    })
-    if (!name) return
-    addLog(
-      'INFO',
-      '保活',
-      `${on ? '已开启' : '已关闭'} ${name} 的自动保活` +
-        (on ? `（立即执行一次，随后每 ${interval} 分钟一轮；期间你在其它设备上连这台会被挤掉）` : '（该实例不再产生任何连接）'),
-      ai,
-    )
-    if (canRun) runKeepalive(ai, pcIndex)
+      if (zeroSinceRef.current == null) {
+        zeroSinceRef.current = Date.now()
+        return
+      }
+      if (Date.now() - zeroSinceRef.current >= 3000) {
+        zeroSinceRef.current = null
+        void fetchState(undefined, true)
+      }
+    }, 1000)
+    return () => {
+      clearInterval(tick)
+      clearInterval(check)
+    }
+  }, [])
+
+  /* 过渡态加速收敛：快照含 starting/stopping 时 5s 轮询 */
+  const transitional = hasTransitionalRun(accounts)
+  useEffect(() => {
+    if (!transitional) return
+    const id = setInterval(() => {
+      void fetchState(undefined, true)
+    }, 5000)
+    return () => clearInterval(id)
+  }, [transitional])
+
+  /* 日志：切到日志页签 / 切账号 / 筛选变化时拉当前激活账号（关键字 300ms debounce） */
+  useEffect(() => {
+    if (!ready || tab !== 'log' || activeUid == null) return
+    const delay = kw.trim() ? 300 : 0
+    const id = setTimeout(() => loadLogsFor(activeUid), delay)
+    return () => clearTimeout(id)
+  }, [ready, tab, activeUid, lv, mod, kw, includeSys])
+
+  /* 删除目标已从快照消失（典型：删除超时但后端其实已删）时关闭弹窗，避免留下空白弹窗 */
+  useEffect(() => {
+    if (delBusy || dlg?.kind !== 'del') return
+    if (!accounts.some((account) => account.userId === dlg.uid)) setDlg(null)
+  }, [accounts, dlg, delBusy])
+
+  /* ── 弹窗 ─────────────────────────────────────────────────── */
+  const contentRef = useRef<Dlg>(null)
+  if (dlg) contentRef.current = dlg
+
+  function openDlg(next: Exclude<Dlg, null>) {
+    setToasts([])
+    setAddBusy(false)
+    setDelBusy(false)
+    setSession((value) => value + 1)
+    setDlg(next)
+  }
+  function closeDlg() {
+    setDlg(null)
+  }
+  const openAdd = (editUid: number | null) => openDlg({ kind: 'add', editUid })
+  const openDel = (userId: number) => {
+    if (accountsRef.current.some((account) => account.userId === userId)) openDlg({ kind: 'del', uid: userId })
   }
 
-  /* ── 保活间隔：校验已在面板内完成（1–59），这里按新间隔重排该账号所有计划 ── */
-  const onIntervalCommit = (ai: number, v: number) => {
-    setAccounts((prev) => {
-      const next = cloneAccounts(prev)
-      const a = next[ai]
-      if (!a) return prev
-      a.interval = v
-      a.pcs.forEach((p) => {
-        if (p.auto && p.link == null && p.run === 'running') p.left = v * 60
-      })
-      return next
-    })
+  /* ── 数据局部 patch ───────────────────────────────────────── */
+  function patchAccount(userId: number, patch: (account: Account) => Account) {
+    setAccounts((prev) => prev.map((account) => (account.userId === userId ? patch(account) : account)))
+  }
+  function patchPc(userId: number, desktopId: string, patch: (pc: Account['pcs'][number]) => Account['pcs'][number]) {
+    patchAccount(userId, (account) => ({
+      ...account,
+      pcs: account.pcs.map((pc) => (pc.desktopId === desktopId ? patch(pc) : pc)),
+    }))
+  }
+  function patchTask(userId: number, taskDefId: number, patch: (task: Account['tasks'][number]) => Account['tasks'][number]) {
+    patchAccount(userId, (account) => ({
+      ...account,
+      tasks: account.tasks.map((task) => (task.taskDefId === taskDefId ? patch(task) : task)),
+    }))
   }
 
-  /* ── 警示条按钮：登录失败 → 预填修正态；需人工处理 → 重试登录 ── */
-  const onBannerAction = (ai: number, act: 'relogin' | 'retry') => {
-    if (act === 'relogin') {
-      openAdd(ai)
+  /* ── 账号操作（同步执行，最长 35s busy） ──────────────────── */
+  async function submitAdd(values: AddFormValues) {
+    const current = contentRef.current
+    if (current?.kind !== 'add') return
+    const editUid = current.editUid
+    if (editUid == null && accountsRef.current.length >= maxAccounts) {
+      pushToast(`最多 ${maxAccounts} 个账号，避免并发请求过密`, `code=${ErrorCode.AccountLimit}`)
       return
     }
-    const mask = accountsRef.current[ai]?.mask ?? ''
-    setAccounts((prev) => {
-      const next = cloneAccounts(prev)
-      const a = next[ai]
-      if (a) {
-        a.dot = 'load'
-        a.banner = { tone: 'idle', act: null, text: '正在重试登录…（这一步只在你点击后发生，工具不会自己反复重登）', btn: null }
-      }
-      return next
-    })
-    addLog('INFO', '账号', `${mask} 人工确认后重试登录`, ai)
-    setTimeout(() => {
-      setAccounts((prev) => {
-        const next = cloneAccounts(prev)
-        const acc = next[ai]
-        if (acc) {
-          acc.dot = 'ok'
-          acc.banner = null
-          acc.emptyText = null
-          if (!acc.pcs.length) acc.pcs = demoPcs()
-        }
-        return next
-      })
-      addLog('INFO', '账号', `${mask} 重试登录成功 · 已恢复该账号的自动任务排程 · 实例自动开关保持你上次设置的状态`, ai)
-    }, 1400)
-  }
 
-  /* ── 新增账号 / 修正凭据：先登录、后落库；落库前按 userId 去重 ── */
-  const submitAdd = (v: AddFormValues) => {
-    const edit = dlg?.kind === 'add' ? dlg.edit : -1
-    /* 已添加过的账号不在这里拦——照常走登录，拿到 userId 后在落库前去重 */
-    if (edit < 0 && accountsRef.current.length >= MAX_ACCOUNTS) {
-      pushToast(`最多 ${MAX_ACCOUNTS} 个账号，避免并发请求过密`)
-      return
-    }
     setAddBusy(true)
-    setTimeout(() => {
-      setAddBusy(false)
-      const cur = accountsRef.current
-      const old = edit >= 0 ? cur[edit] : undefined
-      if (edit >= 0 && !old) {
+    try {
+      if (editUid == null) {
+        const result = await api.createAccount({
+          userAccount: values.acct,
+          password: values.pw,
+          alias: values.alias,
+        })
+        noteRevision(result.revision)
+        clearTombstone(result.account.userId)
+        setAccounts((prev) => [...prev.filter((account) => account.userId !== result.account.userId), result.account])
+        setActiveUid(result.account.userId)
         closeDlg()
-        return
-      }
-      /* 演示失败分支：修正态里密码一个字符都没改，服务端仍然返回 51010 */
-      if (old && v.pw === old.pw && v.acct === old.full) {
-        pushToast('账号或密码不正确，请检查后重新提交', 'code=51010')
-        addLog('ERROR', '账号', `${maskOf(v.acct)} 重新登录失败：账号或密码不正确（code=51010），该账号自动任务仍然挂起`, edit)
-        return
-      }
-      const mask = maskOf(v.acct)
-      const uid = demoUid(v.acct) /* 真实实现里这个值来自登录响应的 userId */
-      /* 去重结果在提交前算好：旧记录里与新 userId 相同的（除被替换者外）将被移除 */
-      const removedPairs = cur.map((a, i) => ({ a, i })).filter(({ a, i }) => a.uid === uid && i !== edit)
-      const base = edit >= 0 ? edit : cur.length
-      const newActive = base - removedPairs.filter(({ i }) => i < base).length
-
-      let msg: string
-      if (old) {
-        msg =
-          (v.acct === old.full
-            ? `账号 ${mask} 的凭据已更正并登录成功：仍然按「先删原账号、再加新账号」执行`
-            : `账号 ${old.mask} 已替换为 ${mask}`) +
-          `（保活间隔 ${old.interval} 分钟、积分时间窗口与各实例自动开关按位置继承；原账号的日志已清除）`
+        invalidateLogViews([result.account.userId], result.account)
+        if (result.replacedAlias) pushToast(`已按「只保留最后一次添加的账号信息」顶替原账号「${result.replacedAlias}」`)
+        result.warnings.forEach((warning) => pushToast(warning))
+        void fetchState(result.revision, true)
       } else {
-        msg = `新增账号 ${mask} 登录成功 · 密码已明文写入配置文件 · 该账号所有实例的自动保活开关默认关闭，需逐台打开`
+        const result = await api.updateCredentials(editUid, {
+          userAccount: values.acct,
+          password: values.pw,
+          alias: values.alias,
+        })
+        noteRevision(result.revision)
+        clearTombstone(editUid)
+        clearTombstone(result.account.userId)
+        const nextUid = result.account.userId
+        setAccounts((prev) => {
+          const index = prev.findIndex((account) => account.userId === editUid)
+          const rest = prev.filter((account) => account.userId !== editUid && account.userId !== nextUid)
+          if (nextUid === editUid) rest.splice(Math.min(Math.max(index, 0), rest.length), 0, result.account)
+          else rest.push(result.account)
+          return rest
+        })
+        setActiveUid(nextUid)
+        closeDlg()
+        invalidateLogViews([editUid, nextUid], result.account)
+        result.warnings.forEach((warning) => pushToast(warning))
+        void fetchState(result.revision, true)
       }
-
-      setAccounts((prev) => {
-        let next = cloneAccounts(prev)
-        if (edit >= 0) {
-          const t = next[edit]
-          if (t) {
-            /* 留空就是留空：Tab 名回落到完整账号，不再塞掩码进去 */
-            t.full = v.acct
-            t.pw = v.pw
-            t.alias = v.alias
-            t.mask = mask
-            t.uid = uid
-            t.dot = 'ok'
-            t.banner = null
-            t.emptyText = null
-            t.logs = [] /* 旧日志属于被删掉的那个账号，一并清除 */
-            if (!t.pcs.length) t.pcs = demoPcs()
-          }
-        } else {
-          next.push({ alias: v.alias, mask, full: v.acct, pw: v.pw, uid, dot: 'ok', interval: 19, banner: null, pcs: demoPcs(), logs: [] })
-        }
-        /* 落库前的最后一步：同一 userId 只留这一条 */
-        next = next.filter((a, i) => i === (edit >= 0 ? edit : next.length - 1) || a.uid !== uid)
-        return next
-      })
-      setActive(newActive)
-      addLog('INFO', '账号', msg, newActive)
-      /* 旧 Tab 连它的日志一起消失，所以这类记录只能落进系统日志；userId 的值本身不进日志 */
-      removedPairs.forEach(({ a: gone }) =>
-        addLog(
-          'INFO',
-          '账号',
-          `本次添加的 ${mask} 与已有账号 ${gone.alias ? gone.alias + ' ' + gone.mask : gone.mask} 是同一个天翼云账号（登录返回的 userId 相同）· 已按「只保留最后一次添加的账号信息」删除旧的那条 · 它的配置（含 password）、保活间隔、积分时间窗口与日志一并移除`,
-          null,
-        ),
-      )
-      closeDlg()
-    }, 1200)
+    } catch (error) {
+      /* 失败：弹窗保持打开、原状态不变；随后 4.1 校正 */
+      handleError(error)
+    } finally {
+      setAddBusy(false)
+    }
   }
 
-  /* ── 删除账号 ─────────────────────────────────────────────── */
-  const confirmDelete = () => {
-    if (dlg?.kind !== 'del') return
-    const idx = dlg.index
-    const a = accountsRef.current[idx]
-    if (!a) {
+  async function confirmDelete() {
+    const current = contentRef.current
+    if (current?.kind !== 'del') return
+    const userId = current.uid
+    const list = accountsRef.current
+    const index = list.findIndex((account) => account.userId === userId)
+    if (index < 0) {
       closeDlg()
       return
     }
-    setAccounts((prev) => prev.filter((_, i) => i !== idx))
-    const newLen = accountsRef.current.length - 1
-    setActive((cur) => (cur >= newLen ? Math.max(0, newLen - 1) : cur))
-    /* 账号连带它的日志一起消失，所以这条记录只能落在「无账号归属」里 */
-    addLog(
-      'INFO',
-      '账号',
-      `已删除账号 ${a.mask} · 配置文件中该条（含 password）已整条移除并覆盖写盘 · 已取消该账号的全部排队与进行中任务 · 该账号的日志已随之删除`,
-      null,
-    )
-    closeDlg()
-  }
 
-  /* ── 积分任务：手动执行 ────────────────────────────────────── */
-  const onRunTask = (i: number) => {
-    const name = tasks[i]?.name ?? '积分任务'
-    setTasks((prev) => prev.map((t, j) => (j === i ? { ...t, busy: true } : t)))
-    setTimeout(() => {
-      setTasks((prev) => prev.map((t, j) => (j === i ? { ...t, busy: false, status: 'done' } : t)))
-      addLog('INFO', '积分', `「${name}」手动执行完成（status=2）· 本次奖励 100 通用积分 · 该任务今日不再自动执行`)
-    }, 1100)
-  }
-  const onToggleTask = (i: number, on: boolean) => {
-    setTasks((prev) => prev.map((t, j) => (j === i ? { ...t, auto: on } : t)))
-  }
-
-  /* ── 日志：导出 / 两步确认清空（每个账号的面板各自挂载，按各自归属过滤） ── */
-  const a = accounts[active]
-  const kwl = kw.trim().toLowerCase()
-  const logsFor = (acc: Account) => {
-    const merged = includeSys ? [...acc.logs, ...syslogs] : [...acc.logs]
-    merged.sort((x, y) => y.seq - x.seq)
-    return {
-      rows: merged.filter(
-        (r) => (lv === 'ALL' || r.lv === lv) && (mod === 'ALL' || r.mod === mod) && (!kwl || (r.msg + ' ' + r.mod).toLowerCase().includes(kwl)),
-      ),
-      total: acc.logs.length + (includeSys ? syslogs.length : 0),
+    setDelBusy(true)
+    /* 删除响应没有 revision：本地墓碑挡住删除前发出、删除后才到的旧快照 */
+    addTombstone(userId)
+    try {
+      await api.deleteAccount(userId)
+      setAccounts((prev) => prev.filter((account) => account.userId !== userId))
+      const neighbor = list[index + 1] ?? list[index - 1]
+      setActiveUid(neighbor?.userId ?? null)
+      closeDlg()
+      invalidateLogViews([userId], neighbor ?? null)
+      void fetchState(undefined, true)
+    } catch (error) {
+      /* 超时 = 结果未知：撤掉墓碑让 4.1 校正带回真实状态；
+         若账号已不在快照，上面的 effect 会关闭删除弹窗 */
+      clearTombstone(userId)
+      handleError(error)
+    } finally {
+      setDelBusy(false)
     }
   }
 
-  const onExport = () => {
-    if (!a) return
-    addLog('INFO', '系统', `已导出当前筛选结果 ${logsFor(a).rows.length} 条为 .log 文件 · 导出内容不含密码，可直接贴到 issue`)
+  async function onBannerAction(userId: number, act: 'relogin' | 'retry') {
+    if (act === 'relogin') {
+      openAdd(userId)
+      return
+    }
+    patchAccount(userId, (account) => ({
+      ...account,
+      dot: 'load',
+      banner: {
+        tone: 'idle',
+        act: null,
+        text: '正在重试登录…（这一步只在你点击后发生，工具不会自己反复重登）',
+        btn: null,
+      },
+    }))
+    try {
+      const result = await api.relogin(userId)
+      noteRevision(result.revision)
+      setAccounts((prev) => prev.map((account) => (account.userId === userId ? result.account : account)))
+      void fetchState(result.revision, true)
+    } catch (error) {
+      handleError(error)
+    }
   }
-  const onClearLogs = () => {
-    const ai = activeRef.current
-    const acc = accountsRef.current[ai]
-    if (!acc) return
-    /* 清空按两步二次确认，不再多开一个弹窗 */
-    if (Date.now() - clearArmedAtRef.current > 4000) {
-      clearArmedAtRef.current = Date.now()
-      setClearArmed(true)
+
+  /* ── 保活操作 ─────────────────────────────────────────────── */
+  async function onManualKeepalive(userId: number, desktopId: string) {
+    const key = desktopKey(userId, desktopId)
+    /* ref 闸门挡住极快双击；busyDesktop 与自动开关共享同一 desktopId 互斥位 */
+    if (manualKeepaliveRef.current.has(key) || busyDesktopRef.current.has(key)) return
+    manualKeepaliveRef.current.add(key)
+    busyDesktopRef.current.add(key)
+    setBusyDesktop((prev) => ({ ...prev, [key]: true }))
+    try {
+      const result = await api.keepalive(userId, desktopId)
+      noteRevision(result.revision)
+      /* 同步执行：code=0 也可能 ok=false，不能直接进成功短态 */
+      if (!result.ok) {
+        pushToast(result.lastMsg || '保活失败，请稍后重试')
+        void fetchState(result.revision, true)
+        return
+      }
+      patchPc(userId, desktopId, (pc) => ({ ...pc, lastAt: result.lastAt, lastMsg: result.lastMsg, left: result.left }))
+      setJustOkPc((prev) => ({ ...prev, [key]: true }))
+      setTimeout(() => setJustOkPc((prev) => withoutKey(prev, key)), 2000)
+      void fetchState(result.revision, true)
+    } catch (error) {
+      handleError(error)
+    } finally {
+      manualKeepaliveRef.current.delete(key)
+      busyDesktopRef.current.delete(key)
+      setBusyDesktop((prev) => withoutKey(prev, key))
+    }
+  }
+
+  async function onToggleAuto(userId: number, desktopId: string, on: boolean) {
+    const key = desktopKey(userId, desktopId)
+    if (busyDesktopRef.current.has(key)) return
+    const account = accountsRef.current.find((item) => item.userId === userId)
+    const pc = account?.pcs.find((item) => item.desktopId === desktopId)
+    if (!pc) return
+    const previous = { auto: pc.auto, left: pc.left }
+    const hold = desktopHold(userId, desktopId)
+
+    busyDesktopRef.current.add(key)
+    setBusyDesktop((prev) => ({ ...prev, [key]: true }))
+    inFlightRef.current.add(hold)
+
+    /* 乐观切换；打开开关的立即保活由后端执行，前端不再调 4.8 */
+    patchPc(userId, desktopId, (item) => ({
+      ...item,
+      auto: on,
+      left: on && item.run === 'running' ? (item.left ?? (account?.interval ?? 19) * 60) : null,
+    }))
+    try {
+      const result = await api.setDesktopAuto(userId, desktopId, on)
+      noteRevision(result.revision)
+      patchPc(userId, desktopId, (item) => ({ ...item, auto: result.auto, left: result.left }))
+      void fetchState(result.revision, true)
+    } catch (error) {
+      /* 超时 = 结果未知：不回滚乐观态，等快照说话 */
+      if (!isTimeout(error)) patchPc(userId, desktopId, (item) => ({ ...item, ...previous }))
+      handleError(error)
+    } finally {
+      inFlightRef.current.delete(hold)
+      busyDesktopRef.current.delete(key)
+      setBusyDesktop((prev) => withoutKey(prev, key))
+    }
+  }
+
+  async function onIntervalCommit(userId: number, minutes: number): Promise<boolean> {
+    return queueAccountSettings(userId, async () => {
+      /* 与 pointsWindow 提交共用 accountHold：同账号同时只允许一个设置写操作 */
+      if (!acquireAccountHold(userId)) return false
+      try {
+        const result = await api.updateSettings(userId, { interval: minutes })
+        noteRevision(result.revision)
+        patchAccount(userId, () => result.account)
+        void fetchState(result.revision, true)
+        return true
+      } catch (error) {
+        handleError(error)
+        /* 超时结果未知：保留输入草稿，等 4.1 校正；仅确定失败才回滚 */
+        return isTimeout(error)
+      } finally {
+        releaseAccountHold(userId)
+      }
+    })
+  }
+
+  async function onRefreshDesktops(userId: number) {
+    if (refreshingRef.current) return
+    refreshingRef.current = true
+    setRefreshing(true)
+    try {
+      const result = await api.listDesktops(userId)
+      patchAccount(userId, (account) => ({ ...account, pcs: result.pcs }))
+      setRefreshedAt(result.refreshedAt)
+      void fetchState(undefined, true)
+    } catch (error) {
+      handleError(error)
+    } finally {
+      refreshingRef.current = false
+      setRefreshing(false)
+    }
+  }
+
+  /* ── 积分任务 ─────────────────────────────────────────────── */
+  async function onRefreshPoints(userId: number) {
+    if (pointsRefreshingRef.current) return
+    pointsRefreshingRef.current = true
+    setRefreshingPoints(true)
+    try {
+      const result = await api.getPoints(userId)
+      patchAccount(userId, (account) => ({ ...account, points: result.points, tasks: result.tasks }))
+      /* 4.10 响应没有 revision：追加一次 4.1，防止更旧的快照覆盖 points/tasks */
+      void fetchState(undefined, true)
+    } catch (error) {
+      handleError(error)
+    } finally {
+      pointsRefreshingRef.current = false
+      setRefreshingPoints(false)
+    }
+  }
+
+  async function onRunTask(userId: number, taskDefId: number) {
+    const key = taskKey(userId, taskDefId)
+    /* 与任务自动开关共用 busyTask：同一 taskDefId 只允许一个在途写操作 */
+    if (busyTaskRef.current.has(key)) return
+    busyTaskRef.current.add(key)
+    setBusyTask((prev) => ({ ...prev, [key]: true }))
+    const hold = taskRunHold(userId, taskDefId)
+    inFlightRef.current.add(hold)
+    try {
+      const accepted = await api.runTask(userId, taskDefId)
+      noteRevision(accepted.revision)
+      /* 异步受理：立即复查一次 4.10，后续状态交给可视刷新与日志 */
+      const result = await api.getPoints(userId)
+      patchAccount(userId, (account) => ({ ...account, points: result.points, tasks: result.tasks }))
+      void fetchState(undefined, true)
+    } catch (error) {
+      handleError(error)
+    } finally {
+      inFlightRef.current.delete(hold)
+      busyTaskRef.current.delete(key)
+      setBusyTask((prev) => withoutKey(prev, key))
+    }
+  }
+
+  async function onToggleTask(userId: number, taskDefId: number, on: boolean) {
+    const key = taskKey(userId, taskDefId)
+    if (busyTaskRef.current.has(key)) return
+    const account = accountsRef.current.find((item) => item.userId === userId)
+    const previous = account?.tasks.find((task) => task.taskDefId === taskDefId)?.auto ?? false
+    const hold = taskAutoHold(userId, taskDefId)
+
+    busyTaskRef.current.add(key)
+    setBusyTask((prev) => ({ ...prev, [key]: true }))
+    inFlightRef.current.add(hold)
+    patchTask(userId, taskDefId, (task) => ({ ...task, auto: on }))
+    try {
+      const result = await api.setTaskAuto(userId, taskDefId, on)
+      noteRevision(result.revision)
+      patchTask(userId, taskDefId, (task) => ({ ...task, auto: result.auto }))
+      void fetchState(result.revision, true)
+    } catch (error) {
+      if (!isTimeout(error)) patchTask(userId, taskDefId, (task) => ({ ...task, auto: previous }))
+      handleError(error)
+    } finally {
+      inFlightRef.current.delete(hold)
+      busyTaskRef.current.delete(key)
+      setBusyTask((prev) => withoutKey(prev, key))
+    }
+  }
+
+  async function onWindowCommit(userId: number, winStart: string, winEnd: string): Promise<boolean> {
+    return queueAccountSettings(userId, async () => {
+      /* 与 interval 提交共用 accountHold：同账号同时只允许一个设置写操作 */
+      if (!acquireAccountHold(userId)) return false
+      try {
+        const result = await api.updateSettings(userId, { pointsWindow: { winStart, winEnd } })
+        noteRevision(result.revision)
+        patchAccount(userId, () => result.account)
+        void fetchState(result.revision, true)
+        return true
+      } catch (error) {
+        handleError(error)
+        /* 超时结果未知：保留输入草稿，等 4.1 校正；仅确定失败才回滚 */
+        return isTimeout(error)
+      } finally {
+        releaseAccountHold(userId)
+      }
+    })
+  }
+
+  /* ── 日志：清空 / 导出 ───────────────────────────────────── */
+  function resetClearArmed(userId: number) {
+    delete clearArmedAtRef.current[userId]
+    setClearArmed((prev) => {
+      if (!prev[userId]) return prev
+      const next = { ...prev }
+      delete next[userId]
+      return next
+    })
+  }
+
+  async function onClearLogs(userId: number) {
+    const armedAt = clearArmedAtRef.current[userId]
+    if (armedAt == null || Date.now() - armedAt > 4000) {
+      clearArmedAtRef.current[userId] = Date.now()
+      setClearArmed((prev) => ({ ...prev, [userId]: true }))
       setTimeout(() => {
-        if (Date.now() - clearArmedAtRef.current >= 4000) {
-          clearArmedAtRef.current = 0
-          setClearArmed(false)
-        }
+        const at = clearArmedAtRef.current[userId]
+        if (at != null && Date.now() - at >= 4000) resetClearArmed(userId)
       }, 4200)
       return
     }
-    clearArmedAtRef.current = 0
-    setClearArmed(false)
-    setAccounts((prev) => {
-      const next = cloneAccounts(prev)
-      if (next[ai]) next[ai].logs = []
-      return next
-    })
-    addLog('INFO', '系统', `已清空 ${acc.mask} 的界面日志 · 磁盘上的日志文件不受影响`, ai)
+
+    resetClearArmed(userId)
+    try {
+      await api.clearLogs(userId)
+      loadLogsFor(userId)
+      void fetchState(undefined, true)
+    } catch (error) {
+      handleError(error)
+    }
   }
 
-  /* 「连接满 1 小时」的接口累计值：total - 剩余，与被占用实例的倒计时同源 */
-  let linkDone: number | null = null
-  accounts.forEach((acc) => acc.pcs.forEach((p) => {
-    if (p.link != null) linkDone = TASK_TOTAL - p.link
-  }))
+  async function onExport() {
+    const userId = activeUidRef.current
+    if (userId == null) return
+    const account = accountsRef.current.find((item) => item.userId === userId)
+    if (!account) return
 
-  /* 每个账号各自的内容：报错账号给错误面板，其余给功能页签 + 三个面板（全部挂载） */
-  const renderContent = (acc: Account, accIdx: number) => {
-    if (acc.banner) return <AccountErrorPanel banner={acc.banner} onAction={(act) => onBannerAction(accIdx, act)} />
-    const { rows, total } = logsFor(acc)
+    const filters = filterRef.current
+    const query: Parameters<typeof api.queryLogs>[0] = {
+      userId,
+      includeSys: filters.includeSys,
+      limit: 1000,
+    }
+    if (filters.lv !== 'ALL') query.lv = filters.lv as LogLevel
+    if (filters.mod !== 'ALL') query.mod = filters.mod as LogModule
+    if (filters.kw.trim()) query.kw = filters.kw.trim()
+
+    try {
+      /* 一次拉满 1000 条（接口上限），超出则明确提示截断 */
+      const result = await api.queryLogs(query)
+      if (result.total > result.rows.length) {
+        pushToast(`导出已截断：仅包含最近 ${result.rows.length} 条，共 ${result.total} 条`)
+      }
+      const text = result.rows.map((row) => `${row.t} [${row.lv}] [${row.mod}] ${row.msg}`).join('\n') + '\n'
+      const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `keepalive-logs-${accountFileSlug(account)}-${dayjs(nowWithOffset(clockOffsetRef.current)).format('YYYYMMDD-HHmmss')}.log`
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+    } catch (error) {
+      handleError(error)
+    }
+  }
+
+  /* ── 页面装配 ─────────────────────────────────────────────── */
+  const activeIndex = Math.max(
+    0,
+    accounts.findIndex((account) => account.userId === activeUid),
+  )
+  const activeAccount = accounts[activeIndex]
+
+  const changeTab = (next: TabKey) => {
+    setTab(next)
+    maybeFetchState(5000)
+  }
+  const selectAccount = (userId: number) => {
+    if (!accounts.some((account) => account.userId === userId)) return
+    setActiveUid(userId)
+    maybeFetchState(5000)
+  }
+
+  const renderContent = (account: Account) => {
+    if (account.banner) {
+      return (
+        <AccountErrorPanel
+          banner={account.banner}
+          onAction={(act) => {
+            void onBannerAction(account.userId, act)
+          }}
+        />
+      )
+    }
+    const view = logViews[account.userId] ?? EMPTY_LOG_VIEW
     return (
       <SubTabs
         tab={tab}
         onChange={changeTab}
-        name={`sub-tabs-${acc.uid}`}
+        name={`sub-tabs-${account.userId}`}
         panels={{
           keepalive: (
             <KeepAlivePanel
-              account={acc}
+              account={account}
               refreshing={refreshing}
               refreshedAt={refreshedAt}
-              onIntervalCommit={(v) => onIntervalCommit(accIdx, v)}
-              onRefresh={doRefresh}
-              onManualKeepalive={(pi) => runKeepalive(accIdx, pi)}
-              onToggleAuto={(pi, on) => onToggleAuto(accIdx, pi, on)}
+              justOkPc={justOkPc}
+              busyDesktop={busyDesktop}
+              onIntervalCommit={(minutes) => onIntervalCommit(account.userId, minutes)}
+              onRefresh={() => {
+                void onRefreshDesktops(account.userId)
+              }}
+              onManualKeepalive={(desktopId) => {
+                void onManualKeepalive(account.userId, desktopId)
+              }}
+              onToggleAuto={(desktopId, on) => {
+                void onToggleAuto(account.userId, desktopId, on)
+              }}
             />
           ),
-          points: <PointsPanel tasks={tasks} linkDone={linkDone} onRunTask={onRunTask} onToggleTask={onToggleTask} />,
+          points: (
+            <PointsPanel
+              account={account}
+              refreshing={refreshingPoints}
+              busyTask={busyTask}
+              onRunTask={(taskDefId) => {
+                void onRunTask(account.userId, taskDefId)
+              }}
+              onToggleTask={(taskDefId, on) => {
+                void onToggleTask(account.userId, taskDefId, on)
+              }}
+              onWindowCommit={(winStart, winEnd) => onWindowCommit(account.userId, winStart, winEnd)}
+              onRefresh={() => {
+                void onRefreshPoints(account.userId)
+              }}
+            />
+          ),
           log: (
             <LogPanel
-              rows={rows}
-              total={total}
-              accountLabel={(acc.alias ? acc.alias + ' ' : '') + acc.mask}
+              rows={view.rows}
+              total={view.total}
+              loading={view.loading}
+              accountLabel={accountLabel(account)}
               lv={lv}
               mod={mod}
               kw={kw}
               includeSys={includeSys}
               autoScroll={autoScroll}
-              clearArmed={clearArmed}
+              clearArmed={!!clearArmed[account.userId]}
               onLv={setLv}
               onMod={setMod}
               onKw={setKw}
               onIncludeSys={setIncludeSys}
               onAutoScroll={setAutoScroll}
-              onExport={onExport}
-              onClear={onClearLogs}
+              onExport={() => {
+                void onExport()
+              }}
+              onClear={() => {
+                void onClearLogs(account.userId)
+              }}
             />
           ),
         }}
@@ -511,42 +975,101 @@ export default function KeepAliveApp() {
     )
   }
 
-  /* 零账号时的空态：整幅提示（与报错账号同形态，不展示功能页签） */
-  const emptyState = <EmptyAccountPanel onAdd={() => openAdd(null)} />
+  if (!ready) {
+    return (
+      <main class="flex h-dvh w-full items-center justify-center px-4 py-4 md:px-8 md:py-6">
+        {loadError ? (
+          <div role="alert" class="alert alert-soft alert-error alert-vertical max-w-md justify-items-center">
+            <p class="text-sm leading-relaxed">加载失败：{loadError}</p>
+            <button
+              type="button"
+              class="btn btn-sm"
+              onClick={() => {
+                setLoadError(null)
+                void fetchState()
+              }}
+            >
+              重试
+            </button>
+          </div>
+        ) : (
+          <div class="flex items-center gap-2 text-sm text-base-content/60" role="status">
+            <span class="loading loading-spinner loading-sm" aria-hidden="true" />
+            正在加载…
+          </div>
+        )}
+      </main>
+    )
+  }
 
-  /* 两个常驻 dialog 的内容配置：关闭动画期间保留（表单随弹窗一起淡出） */
   const addCfg = contentRef.current?.kind === 'add' ? contentRef.current : null
   const delCfg = contentRef.current?.kind === 'del' ? contentRef.current : null
-  const delAccount = delCfg ? accounts[delCfg.index] : undefined
+  const editAccount = addCfg?.editUid != null ? (accounts.find((account) => account.userId === addCfg.editUid) ?? null) : null
+  const delAccount = delCfg ? accounts.find((account) => account.userId === delCfg.uid) : undefined
 
   return (
     <main class="flex h-dvh w-full flex-col px-4 py-4 md:px-8 md:py-6">
-      {/* 所有账号的内容全部挂载，显隐由 :checked + .tab-content 纯 CSS 驱动（水合前可切） */}
-      <AccountTabBar accounts={accounts} active={active} renderContent={renderContent} onSelect={setActive} onDelete={openDel} onAdd={() => openAdd(null)} />
-      {!a && emptyState}
+      {/* 所有账号的内容全部挂载，显隐由 :checked + .tab-content 纯 CSS 驱动 */}
+      <AccountTabBar
+        accounts={accounts}
+        active={activeIndex}
+        maxAccounts={maxAccounts}
+        renderContent={renderContent}
+        onSelect={selectAccount}
+        onDelete={openDel}
+        onAdd={() => openAdd(null)}
+      />
+      {!activeAccount && <EmptyAccountPanel onAdd={() => openAdd(null)} />}
 
       {/* 弹窗层：两个常驻 dialog，open 态驱动；Toast 只在添加弹窗（报错均来自它） */}
-      <ModalLayer open={dlg?.kind === 'add'} labelledBy="dlg-add-t" onRequestClose={closeDlg} toasts={toasts} onDismissToast={dismissToast}>
+      <ModalLayer
+        open={dlg?.kind === 'add'}
+        labelledBy="dlg-add-t"
+        locked={addBusy}
+        onRequestClose={() => {
+          /* 同步登录在途时不允许关闭，避免状态悬空（frontend-design §5.3） */
+          if (!addBusy) closeDlg()
+        }}
+        toasts={toasts}
+        onDismissToast={dismissToast}
+      >
         {addCfg && (
           <AddAccountForm
             key={String(session)}
-            edit={addCfg.edit >= 0 ? (accounts[addCfg.edit] ?? null) : null}
+            edit={editAccount}
             busy={addBusy}
-            onSubmit={submitAdd}
+            onSubmit={(values) => {
+              void submitAdd(values)
+            }}
             onClose={closeDlg}
           />
         )}
       </ModalLayer>
-      <ModalLayer open={dlg?.kind === 'del'} labelledBy="dlg-del-t" onRequestClose={closeDlg} focusClose>
+      <ModalLayer
+        open={dlg?.kind === 'del'}
+        labelledBy="dlg-del-t"
+        locked={delBusy}
+        onRequestClose={() => {
+          if (!delBusy) closeDlg()
+        }}
+        focusClose
+        toasts={toasts}
+        onDismissToast={dismissToast}
+      >
         {delAccount && (
           <DeleteConfirm
-            /* 没填别名时只写掩码，不重复写两遍 */
-            label={delAccount.alias ? delAccount.alias + ' ' + delAccount.mask : delAccount.mask}
-            onConfirm={confirmDelete}
+            label={accountLabel(delAccount)}
+            busy={delBusy}
+            onConfirm={() => {
+              void confirmDelete()
+            }}
             onClose={closeDlg}
           />
         )}
       </ModalLayer>
+
+      {/* 无弹窗时的 Toast 出口；弹窗打开时由 ModalLayer 在 top layer 内渲染，避免被遮罩压住 */}
+      {!dlg && <ToastStack toasts={toasts} onDismiss={dismissToast} />}
     </main>
   )
 }
