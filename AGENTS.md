@@ -44,10 +44,13 @@ shared/                  前后端共享层（不得 import app/ 或 server/）
   types.ts               契约类型：与 api.md §2 / §4 一一对应，响应 data 统一在此命名导出
   constants.ts           账号上限、保活间隔、错误码、超时预算、枚举与默认文案
   utils.ts               时间格式化（nowStr/nowHm/formatHm/formatHms）、maskOf、isHm
-server/                  /api 后端（S1 基础设施，后续里程碑按业务纵切补齐）
+server/                  /api 后端（同进程挂载；按业务纵切补齐）
   index.ts               /api 子应用：路由挂载、未匹配 404、统一错误信封
   envelope.ts            ok / err / ApiError
-  routes/logs.ts         4.1 GET /state 空态快照（4.13/4.14 在 S5 补齐）
+  routes/                accounts.ts（4.2–4.5）、logs.ts（4.1 /state；4.13/4.14 在 S5）
+  core/                  manager.ts（账号生命周期/启动恢复）、session.ts（双平台登录态与快照）
+  upstream/              ctyun-client.ts / eaichat-client.ts / crypto.ts / errors.ts
+  store/                 config.ts（~/.ctyun-pc-keep-alive/config.json 原子写）、logs.ts（内存 ring + 磁盘）
 ```
 
 ## 约定

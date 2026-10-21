@@ -1,6 +1,7 @@
 import { showRoutes } from 'hono/dev'
 import { createApp } from 'honox/server'
 import { apiApp } from '../server'
+import { manager } from '../server/core/manager'
 
 /**
  * 后端与前端同进程：HonoX 服务端即 /api 宿主（backend-design §1.3）。
@@ -13,6 +14,9 @@ const app = createApp({
     app.route('/api', apiApp)
   },
 })
+
+/* 启动恢复在后台执行：先载入配置建立内存账号，再逐账号登录，不阻塞服务启动 */
+void manager.start()
 
 showRoutes(app)
 

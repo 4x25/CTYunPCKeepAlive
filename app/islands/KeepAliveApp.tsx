@@ -279,7 +279,8 @@ export default function KeepAliveApp() {
 
     let next = account
     if (inFlightRef.current.has(accountHold(account.userId))) {
-      next = { ...next, interval: prev.interval }
+      /* 在途操作（设置写 / 重试登录）：banner、dot 冻结为本地态，避免快照冲回 */
+      next = { ...next, interval: prev.interval, dot: prev.dot, banner: prev.banner }
     }
 
     if (next.pcs.some((pc) => inFlightRef.current.has(desktopHold(account.userId, pc.desktopId)))) {
@@ -539,6 +540,7 @@ export default function KeepAliveApp() {
         setAccounts((prev) => {
           const index = prev.findIndex((account) => account.userId === editUid)
           const rest = prev.filter((account) => account.userId !== editUid && account.userId !== nextUid)
+          /* 与后端顺序一致：同 userId 原位替换；换出不同 userId 时落列表尾部 */
           if (nextUid === editUid) rest.splice(Math.min(Math.max(index, 0), rest.length), 0, result.account)
           else rest.push(result.account)
           return rest
@@ -594,6 +596,8 @@ export default function KeepAliveApp() {
       openAdd(userId)
       return
     }
+    /* 拿不到占位说明已有在途操作：不再重复触发 */
+    if (!acquireAccountHold(userId)) return
     patchAccount(userId, (account) => ({
       ...account,
       dot: 'load',
@@ -611,6 +615,8 @@ export default function KeepAliveApp() {
       void fetchState(result.revision, true)
     } catch (error) {
       handleError(error)
+    } finally {
+      releaseAccountHold(userId)
     }
   }
 
