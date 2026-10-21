@@ -231,7 +231,7 @@ export class AccountSession {
         ? {
             tone: info.tone,
             act: info.action,
-            text: `需要你本人处理一次：登录时要求${info.manualLabel}，工具已停止这个账号的自动重登。请到官方客户端登录一次，完成后回来点「重试登录」。`,
+            text: `需要你本人处理一次：登录时要求${info.manualLabel}，工具已停止这个账号的自动重登。请静候 5–10 分钟（期间不要反复重试）后点「重试登录」，或到官方客户端完成验证。`,
             btn: '重试登录',
           }
         : {
