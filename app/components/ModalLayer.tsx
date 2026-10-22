@@ -76,7 +76,8 @@ export default function ModalLayer({ open, labelledBy, onRequestClose, focusClos
           close
         </button>
       </form>
-      {toasts && onDismissToast && <ToastStack toasts={toasts} onDismiss={onDismissToast} />}
+      {/* 只在打开时渲染：两个常驻 dialog 都挂一份会让 DOM 同时存在多份 ToastStack */}
+      {open && toasts && onDismissToast && <ToastStack toasts={toasts} onDismiss={onDismissToast} />}
     </dialog>
   )
 }

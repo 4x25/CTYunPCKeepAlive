@@ -24,10 +24,6 @@ export class UpstreamNetworkError extends UpstreamError {
   }
 }
 
-export function isUpstreamNetworkError(error: unknown): error is UpstreamNetworkError {
-  return error instanceof UpstreamNetworkError
-}
-
 export interface LoginFailureInfo {
   code: number
   /** danger=登录失败（可修正凭据/重试） warn=需人工处理 */

@@ -2,7 +2,7 @@ import type { ApiEnvelope } from '../shared/types'
 
 /**
  * 后端业务异常：路由层抛出，由统一的错误中间件转成信封。
- * code 语义与 shared/constants 的 ErrorCode / UpstreamCode 对齐。
+ * code 语义与 shared/constants 的 ErrorCode / 上游透传码对齐。
  * 注意：HTTP 状态码仍为 200，仅网络/框架层错误使用 4xx/5xx（api.md §1.1）。
  */
 export class ApiError extends Error {

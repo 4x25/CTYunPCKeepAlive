@@ -35,6 +35,8 @@ const LOG_PAGE_SIZE = 200
 const LOG_ROWS_MAX = 1_000
 /** 日志增量轮询间隔：仅「激活账号 + 页面可见」时运行 */
 const LOG_POLL_MS = 5_000
+/** 心跳定时器与节流周期同为 15s 时的调度抖动容差，避免差几毫秒被节流吞掉而退化成 30s */
+const STATE_THROTTLE_JITTER_MS = 500
 /**
  * 增量 total 是客户端「旧 total + 新增条数」累加出来的（服务端只回新增条数），
  * 服务端 ring 轮转（每账号 2000 条）与 limit 截断都会让它缓慢偏离真实值。
@@ -56,7 +58,7 @@ function mergeLogRows(base: LogEntry[], incoming: LogEntry[]): LogEntry[] {
 /** 删除墓碑 TTL：挡住删除前发出、删除后才到的旧快照，10s 后自动解除 */
 const TOMBSTONE_TTL_MS = 10_000
 
-const withoutKey = <T,>(record: Record<string, T>, key: string): Record<string, T> => {
+const withoutKey = <K extends string | number, T>(record: Record<K, T>, key: K): Record<K, T> => {
   const next = { ...record }
   delete next[key]
   return next
@@ -98,8 +100,12 @@ export default function KeepAliveApp() {
   const [session, setSession] = useState(0)
 
   /* 前端短态：手动保活 / 任务执行 / 开关在途，挂在 island，不进服务端模型 */
-  const [refreshing, setRefreshing] = useState(false)
-  const [refreshingPoints, setRefreshingPoints] = useState(false)
+  /* 按账号记录「刷新列表」在途，避免一个账号刷新时所有账号的按钮一起转圈 */
+  const [refreshing, setRefreshing] = useState<Record<number, boolean>>({})
+  /* 按账号记录「刷新任务」在途，避免一个账号刷新时所有账号的按钮一起转圈 */
+  const [refreshingPoints, setRefreshingPoints] = useState<Record<number, boolean>>({})
+  /* 4.10 返回 30060（设备未绑定）的账号：仅前端内存态，成功拉取后清除 */
+  const [pointsDeviceUnbound, setPointsDeviceUnbound] = useState<Record<number, boolean>>({})
   const [justOkPc, setJustOkPc] = useState<Record<string, boolean>>({})
   /* busyDesktop / busyTask 是同一资源的唯一在途标记：手动保活与自动开关共用前者，任务执行与任务开关共用后者 */
   const [busyDesktop, setBusyDesktop] = useState<Record<string, boolean>>({})
@@ -131,8 +137,8 @@ export default function KeepAliveApp() {
   const snapshotInFlightRef = useRef(false)
   const pendingFetchRef = useRef<PendingFetch | null>(null)
   const lastStateAtRef = useRef(0)
-  const refreshingRef = useRef(false)
-  const pointsRefreshingRef = useRef(false)
+  const refreshingRef = useRef<Set<number>>(new Set())
+  const pointsRefreshingRef = useRef<Set<number>>(new Set())
   const clearArmedAtRef = useRef<Record<number, number>>({})
   const toastIdRef = useRef(0)
   const zeroSinceRef = useRef<number | null>(null)
@@ -515,9 +521,13 @@ export default function KeepAliveApp() {
     }
   }
 
-  /** 可视刷新 / 切 Tab 的节流入口 */
+  /** 可视刷新 / 切 Tab / 可见心跳的共用节流入口（在途时不叠加请求） */
   function maybeFetchState(minGapMs: number) {
-    if (Date.now() - lastStateAtRef.current < minGapMs) return
+    if (snapshotInFlightRef.current) return
+    const gap = Math.max(0, minGapMs - STATE_THROTTLE_JITTER_MS)
+    if (Date.now() - lastStateAtRef.current < gap) return
+    /* 发起即记时：失败时也按节流重试，避免焦点/心跳在同一窗口内重复请求 */
+    lastStateAtRef.current = Date.now()
     void fetchState(undefined, true)
   }
 
@@ -548,13 +558,21 @@ export default function KeepAliveApp() {
     }
     document.addEventListener('visibilitychange', maybeVisibleRefresh)
     window.addEventListener('focus', maybeVisibleRefresh)
+    /* 可见心跳：后端重启没有事件可依赖，长开页面每 15s 主动拉一次 /state，
+       与 focus/visibility 共用 maybeFetchState 节流，拉到新 bootId 后由 resetForNewBoot 重置水位 */
+    const heartbeat = setInterval(() => {
+      if (document.hidden) return
+      maybeFetchState(15_000)
+    }, 15_000)
     return () => {
+      clearInterval(heartbeat)
       document.removeEventListener('visibilitychange', maybeVisibleRefresh)
       window.removeEventListener('focus', maybeVisibleRefresh)
     }
   }, [])
 
-  /* 每秒推进倒计时：left 减到 0 停住；停 3s 未校正则主动拉一次 /state */
+  /* 每秒推进倒计时：left 减到 0 停住；0 后 3s 内没有等到校正则主动拉一次 /state。
+     500ms 检查一次，保证「停 0」被观察到的延迟不超过 0.5s，最迟 ~3.5s 触发（对齐 UI 走查）。 */
   useEffect(() => {
     const tick = setInterval(() => {
       setAccounts((prev) => projectCountdowns(prev))
@@ -572,7 +590,7 @@ export default function KeepAliveApp() {
         zeroSinceRef.current = null
         void fetchState(undefined, true)
       }
-    }, 1000)
+    }, 500)
     return () => {
       clearInterval(tick)
       clearInterval(check)
@@ -676,6 +694,19 @@ export default function KeepAliveApp() {
     }))
   }
 
+  /** 4.10 成功结果统一落地：更新积分/任务，并清除该账号之前的 30060 行内警示 */
+  function applyPointsResult(userId: number, result: Awaited<ReturnType<typeof api.getPoints>>) {
+    patchAccount(userId, (account) => ({ ...account, points: result.points, tasks: result.tasks }))
+    setPointsDeviceUnbound((prev) => withoutKey(prev, userId))
+  }
+
+  /** 4.10 失败若为 30060（设备未绑定）：置位行内警示；成功路径由 applyPointsResult 统一清除 */
+  function notePointsError(userId: number, error: unknown) {
+    if (isApiError(error) && error.code === 30060) {
+      setPointsDeviceUnbound((prev) => ({ ...prev, [userId]: true }))
+    }
+  }
+
   /* ── 账号操作（同步执行，最长 35s busy） ──────────────────── */
   async function submitAdd(values: AddFormValues) {
     const current = contentRef.current
@@ -697,6 +728,8 @@ export default function KeepAliveApp() {
         })
         noteRevision(result.revision, epoch)
         clearTombstone(result.account.userId)
+        /* 顶替重加同 userId：旧账号的设备绑定警示不再适用 */
+        setPointsDeviceUnbound((prev) => withoutKey(prev, result.account.userId))
         setAccounts((prev) => [...prev.filter((account) => account.userId !== result.account.userId), result.account])
         setActiveUid(result.account.userId)
         closeDlg()
@@ -715,6 +748,8 @@ export default function KeepAliveApp() {
         clearTombstone(editUid)
         clearTombstone(result.account.userId)
         const nextUid = result.account.userId
+        /* 修正凭据可能顶替同 userId 的旧账号：清掉旧账号的设备绑定警示 */
+        setPointsDeviceUnbound((prev) => withoutKey(withoutKey(prev, editUid), nextUid))
         setAccounts((prev) => {
           const index = prev.findIndex((account) => account.userId === editUid)
           const rest = prev.filter((account) => account.userId !== editUid && account.userId !== nextUid)
@@ -753,6 +788,7 @@ export default function KeepAliveApp() {
     addTombstone(userId)
     try {
       await api.deleteAccount(userId)
+      setPointsDeviceUnbound((prev) => withoutKey(prev, userId))
       setAccounts((prev) => prev.filter((account) => account.userId !== userId))
       const neighbor = list[index + 1] ?? list[index - 1]
       setActiveUid(neighbor?.userId ?? null)
@@ -892,9 +928,9 @@ export default function KeepAliveApp() {
   }
 
   async function onRefreshDesktops(userId: number) {
-    if (refreshingRef.current) return
-    refreshingRef.current = true
-    setRefreshing(true)
+    if (refreshingRef.current.has(userId)) return
+    refreshingRef.current.add(userId)
+    setRefreshing((prev) => ({ ...prev, [userId]: true }))
     try {
       const result = await api.listDesktops(userId)
       patchAccount(userId, (account) => ({ ...account, pcs: result.pcs }))
@@ -903,26 +939,29 @@ export default function KeepAliveApp() {
     } catch (error) {
       handleError(error)
     } finally {
-      refreshingRef.current = false
-      setRefreshing(false)
+      refreshingRef.current.delete(userId)
+      setRefreshing((prev) => withoutKey(prev, userId))
     }
   }
 
   /* ── 积分任务 ─────────────────────────────────────────────── */
   async function onRefreshPoints(userId: number) {
-    if (pointsRefreshingRef.current) return
-    pointsRefreshingRef.current = true
-    setRefreshingPoints(true)
+    if (pointsRefreshingRef.current.has(userId)) return
+    pointsRefreshingRef.current.add(userId)
+    setRefreshingPoints((prev) => ({ ...prev, [userId]: true }))
     try {
       const result = await api.getPoints(userId)
-      patchAccount(userId, (account) => ({ ...account, points: result.points, tasks: result.tasks }))
+      applyPointsResult(userId, result)
       /* 4.10 响应没有 revision：追加一次 4.1，防止更旧的快照覆盖 points/tasks */
       void fetchState(undefined, true)
     } catch (error) {
+      /* 30060：账号本身仍 ok，只是积分任务需先到官方客户端完成设备绑定。
+         记录为前端内存态，由积分面板显示行内警示条；成功拉取后自动清除。 */
+      notePointsError(userId, error)
       handleError(error)
     } finally {
-      pointsRefreshingRef.current = false
-      setRefreshingPoints(false)
+      pointsRefreshingRef.current.delete(userId)
+      setRefreshingPoints((prev) => withoutKey(prev, userId))
     }
   }
 
@@ -935,10 +974,11 @@ export default function KeepAliveApp() {
       if (!accountsRef.current.some((account) => account.userId === userId)) return
       try {
         const result = await api.getPoints(userId)
-        patchAccount(userId, (account) => ({ ...account, points: result.points, tasks: result.tasks }))
+        applyPointsResult(userId, result)
         void fetchState(undefined, true)
-      } catch {
-        /* 复查失败不打扰用户：可视刷新/切页签还有兜底 */
+      } catch (error) {
+        /* 复查失败不打扰用户：可视刷新/切页签还有兜底；但 30060 仍需置位行内警示 */
+        notePointsError(userId, error)
       }
     }
     setTimeout(() => void tick(), 10_000)
@@ -963,9 +1003,10 @@ export default function KeepAliveApp() {
          只做一次静默的 4.1 校正；执行结果交给 10s/26s 跟进与可视刷新 */
       try {
         const result = await api.getPoints(userId)
-        patchAccount(userId, (account) => ({ ...account, points: result.points, tasks: result.tasks }))
-      } catch {
-        /* 静默：后续跟进与可视刷新兜底 */
+        applyPointsResult(userId, result)
+      } catch (error) {
+        /* 静默：后续跟进与可视刷新兜底；但 30060 仍需置位行内警示 */
+        notePointsError(userId, error)
       }
       void fetchState(undefined, true)
     } catch (error) {
@@ -1140,7 +1181,7 @@ export default function KeepAliveApp() {
           keepalive: (
             <KeepAlivePanel
               account={account}
-              refreshing={refreshing}
+              refreshing={!!refreshing[account.userId]}
               refreshedAt={refreshedAt}
               justOkPc={justOkPc}
               busyDesktop={busyDesktop}
@@ -1159,7 +1200,8 @@ export default function KeepAliveApp() {
           points: (
             <PointsPanel
               account={account}
-              refreshing={refreshingPoints}
+              refreshing={!!refreshingPoints[account.userId]}
+              deviceUnbound={!!pointsDeviceUnbound[account.userId]}
               busyTask={busyTask}
               onRunTask={(taskDefId) => {
                 void onRunTask(account.userId, taskDefId)

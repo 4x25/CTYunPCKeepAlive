@@ -1,6 +1,6 @@
 # CTYunPCKeepAlive
 
-天翼云电脑保活助手的 Web 前端（交互原型阶段）。技术栈：HonoX（hono/jsx + islands）· Vite · Tailwind CSS 4 · daisyUI 5 · dayjs。
+天翼云电脑保活助手（全栈实现阶段：HonoX 页面 + 同进程 `/api` 后端）。技术栈：HonoX（hono/jsx + islands）· Vite · Tailwind CSS 4 · daisyUI 5 · dayjs。
 
 ## 常用命令
 

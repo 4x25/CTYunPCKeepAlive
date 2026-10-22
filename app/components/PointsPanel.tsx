@@ -26,6 +26,8 @@ interface Props {
   account: Account
   /** 「刷新任务」单飞在途 */
   refreshing: boolean
+  /** 4.10 返回 30060：账号可用，但积分任务需先完成设备绑定 */
+  deviceUnbound: boolean
   /** 任务执行与自动开关共用的在途状态，键为 `userId:taskDefId` */
   busyTask: Readonly<Record<string, boolean>>
   onRunTask: (taskDefId: number) => void
@@ -97,6 +99,12 @@ export default function PointsPanel(props: Props) {
           </button>
         </div>
       </div>
+
+      {props.deviceUnbound && (
+        <div role="alert" class="alert alert-soft alert-warning mb-3 py-2 text-xs">
+          <span>需要在官方客户端完成设备绑定后才能使用积分任务</span>
+        </div>
+      )}
 
       <div class="flex flex-wrap items-baseline gap-8 px-2 pb-3.5">
         <div>

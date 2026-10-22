@@ -257,8 +257,3 @@ export function queryLogs(input: LogQueryInput = {}): LogsResult {
 export function clearAccountLogs(userId: number): void {
   accountLogs.delete(userId)
 }
-
-/** 当前全局 seq（诊断 / 沙箱自检用） */
-export function currentSeq(): number {
-  return seq
-}

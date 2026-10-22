@@ -16,7 +16,7 @@ import { createWarnThrottle } from './warn-throttle'
 import type { AccountSession } from './session'
 
 /** 单次上游保活请求超时（异常上限；实测典型 <1s） */
-export const KEEPALIVE_TIMEOUT_MS = 30_000
+const KEEPALIVE_TIMEOUT_MS = 30_000
 
 export type KeepaliveFailureKind = 'network' | 'auth' | 'business'
 
@@ -138,7 +138,8 @@ async function callUpstream(
     const eai = session.getEaichatClient()
     if (!eai) throw new UpstreamError(40010, '云智助手未登录')
     const remaining = limit - Date.now()
-    if (remaining <= 0) throw new UpstreamNetworkError('保活请求超过 30000 ms')
+    /* limit 是整轮预算（手动 12s / 自动 30s）：超时文案跟随实际截止时间，不写死具体毫秒数 */
+    if (remaining <= 0) throw new UpstreamNetworkError(`保活请求超过 ${Math.max(0, limit - lastAt)} ms`)
     await eai.preventPowerStrategy({
       desktopName: desktop.desktopName,
       desktopUuid: uuid,

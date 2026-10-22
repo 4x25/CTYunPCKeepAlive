@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'hono/jsx'
+import { useEffect, useRef, useState } from 'hono/jsx'
 import { MAX_INTERVAL_MINUTES, MIN_INTERVAL_MINUTES } from '../../shared/constants'
 import type { Account, PcInstance } from '../lib/types'
 import { lastCell, pcsEmptyText, refreshedLabel } from '../lib/derive'
@@ -73,9 +73,12 @@ export default function KeepAlivePanel(props: Props) {
   const { account: a } = props
   const [draft, setDraft] = useState(() => String(a.interval))
   const [intervalErr, setIntervalErr] = useState('')
+  /* Enter 后紧跟 blur 会再次触发 commit：在途值直接短路，避免重复发 4.6 */
+  const pendingRef = useRef<number | null>(null)
 
   /* 服务端 interval 变化（操作响应 / 快照校正）时同步输入框 */
   useEffect(() => {
+    pendingRef.current = null
     setDraft(String(a.interval))
     setIntervalErr('')
   }, [a.interval])
@@ -91,10 +94,12 @@ export default function KeepAlivePanel(props: Props) {
     }
     setIntervalErr('')
     setDraft(String(v))
-    if (v !== a.interval) {
-      const ok = await props.onIntervalCommit(v)
-      if (!ok) setDraft(String(a.interval))
-    }
+    /* 与当前服务端值相同（已保存）或在途（Enter + blur 双触发）时不再发请求 */
+    if (v === a.interval || v === pendingRef.current) return
+    pendingRef.current = v
+    const ok = await props.onIntervalCommit(v)
+    if (pendingRef.current === v) pendingRef.current = null
+    if (!ok) setDraft(String(a.interval))
   }
 
   return (

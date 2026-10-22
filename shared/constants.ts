@@ -35,18 +35,10 @@ export const TASK_UNSUPPORTED_REASON: Record<number, string> = {
 /** 「使用1小时」类任务本期不实现自动执行，link 恒为 null（backend-design §4.2） */
 export const LINK_TOTAL_SECONDS = 3600
 
-/* ── 枚举取值（S2 路由层 zod 校验 / 遍历用；S1 暂未全部消费） ── */
+/* ── 枚举取值（路由层 zod 校验用） ───────────────────────── */
 
-export const DOT_TONES = ['ok', 'danger', 'warn', 'load'] as const
-export const RUN_STATES = ['running', 'starting', 'stopping', 'stopped', 'error'] as const
-export const TASK_STATUSES = [0, 1, 2, 3] as const
-export const BANNER_TONES = ['danger', 'warn', 'idle'] as const
-export const BANNER_ACTIONS = ['relogin', 'retry'] as const
 export const LOG_LEVELS = ['DEBUG', 'INFO', 'WARN', 'ERROR'] as const
 export const LOG_MODULES = ['账号', '保活', '积分', '调度', '系统'] as const
-
-/** 这些运行状态下不允许手动/自动保活（工具不代为开机） */
-export const KEEPALIVE_BLOCKED_RUNS = ['stopped', 'starting', 'stopping'] as const
 
 /* ── 错误码 ───────────────────────────────────────────────── */
 
@@ -63,28 +55,6 @@ export const ErrorCode = {
   TaskNotFound: 10007,
   EaichatUnavailable: 10008,
 } as const
-
-export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode]
-
-/** 上游业务错误码（api.md §1.2 ①，直接透传） */
-export const UpstreamCode = {
-  LoginExpired: 40010,
-  SignatureInvalid: 40011,
-  ParamInvalid: 40050,
-  InvalidPassword: 51010,
-  AccountLocked: 51020,
-  CaptchaInvalid31: 51031,
-  CaptchaRequired30: 51030,
-  CaptchaRequired: 51040,
-  CaptchaInvalid: 51085,
-  SmsCodeInvalid: 51090,
-  SmsCodeExpired: 51091,
-  Processing: 30010,
-  SwitchRegion: 30020,
-  OperationConflict: 52070,
-} as const
-
-export type UpstreamCodeValue = (typeof UpstreamCode)[keyof typeof UpstreamCode]
 
 /** 默认用户可读文案（接口可覆盖） */
 export const ERROR_MESSAGES: Record<number, string> = {

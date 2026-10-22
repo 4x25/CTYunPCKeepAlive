@@ -187,7 +187,3 @@ export function saveConfig(config: PersistedConfig): Promise<void> {
   )
   return run
 }
-
-export async function saveEmptyConfig(): Promise<void> {
-  await saveConfig(emptyConfig())
-}

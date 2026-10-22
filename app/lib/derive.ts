@@ -78,7 +78,7 @@ export function tasksEmptyText(): string {
 
 /* ── 积分任务 ─────────────────────────────────────────────── */
 
-export function isDurationTask(taskDefId: number): boolean {
+function isDurationTask(taskDefId: number): boolean {
   return (TASK_DURATION_IDS as readonly number[]).includes(taskDefId)
 }
 

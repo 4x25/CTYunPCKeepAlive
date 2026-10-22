@@ -170,10 +170,6 @@ export interface PatchSettingsBody {
   pointsWindow?: PointsWindow
 }
 
-export interface SetAutoBody {
-  auto: boolean
-}
-
 /** 4.13 日志查询参数 */
 export interface LogQuery {
   userId?: number

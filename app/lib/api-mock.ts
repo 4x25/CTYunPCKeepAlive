@@ -1,7 +1,7 @@
 /**
  * 与 api.ts 同签名的内存假实现（frontend-design §3.3）。
  *
- * - 种子数据自原 app/lib/mock-data.ts 搬迁并换算为 api.md §2 的模型；
+ * - 内置演示种子（无外部种子文件），字段换算为 api.md §2 的模型；
  * - revision 按「任何变更 +1」维护；
  * - 保活计划用 nextAt 惰性推进：getState 时结算已到点的实例并写日志，
  *   与真实后端「left 实时计算」的口径一致。
@@ -851,7 +851,7 @@ export const mockApi: ApiClient = {
       pc.lastAt = Date.now()
       pc.lastMsg = failure
       appendLog(userId, 'ERROR', '保活', `${pc.desktopName} ${failure}`)
-      throw new ApiError(ErrorCode.UpstreamNetwork, '保活请求失败：请求超过 30000 ms')
+      throw new ApiError(ErrorCode.UpstreamNetwork, '保活请求失败：网络异常或超时，请稍后重试')
     }
 
     const elapsedMs = latency(380, 140)
