@@ -2,9 +2,7 @@ import { useEffect, useState } from 'hono/jsx'
 import type { Account, PointTask } from '../lib/types'
 import {
   isExecutableTask,
-  pointsDetail,
   pointsText,
-  pointsTotal,
   rewardOf,
   taskDoneLabel,
   taskProgressRatio,
@@ -16,6 +14,7 @@ import {
 } from '../lib/derive'
 import { formatHm } from '../../shared/utils'
 import HelpMark from './HelpMark'
+import { HeroIcon, HERO_REFRESH } from './icons'
 
 function StatusBadge({ task }: { task: PointTask }) {
   const badge = taskStatusBadge(task)
@@ -60,7 +59,7 @@ export default function PointsPanel(props: Props) {
 
   const tasks = account.tasks
   const done = todayDone(tasks)
-  const points = pointsTotal(account.points)
+  const pointGroups = account.points.pointsList
 
   return (
     <div role="tabpanel" aria-label="积分任务" class="flex h-full min-h-0 flex-col">
@@ -93,9 +92,19 @@ export default function PointsPanel(props: Props) {
           <span class="font-mono text-xs text-base-content/60">
             更新于 {account.points.updatedDate ? formatHm(account.points.updatedDate) : '—'}
           </span>
-          <button type="button" class="btn btn-xs" disabled={props.refreshing} onClick={props.onRefresh}>
-            {props.refreshing && <span class="loading loading-spinner loading-xs" aria-hidden="true" />}
-            刷新任务
+          <button
+            type="button"
+            class="btn btn-ghost btn-xs btn-square"
+            aria-label="刷新任务"
+            title="刷新任务"
+            disabled={props.refreshing}
+            onClick={props.onRefresh}
+          >
+            {props.refreshing ? (
+              <span class="loading loading-spinner loading-xs" aria-hidden="true" />
+            ) : (
+              <HeroIcon icon={HERO_REFRESH} class="h-3.5 w-3.5" />
+            )}
           </button>
         </div>
       </div>
@@ -107,11 +116,21 @@ export default function PointsPanel(props: Props) {
       )}
 
       <div class="flex flex-wrap items-baseline gap-8 px-2 pb-3.5">
-        <div>
-          <p class="font-mono text-xs text-base-content/60">当前积分</p>
-          <div class="font-mono text-4xl font-semibold tabular-nums tracking-tight">{pointsText(points)}</div>
-          {account.points.pointsList.length > 0 && (
-            <p class="mt-1 font-mono text-[11px] text-base-content/50">{pointsDetail(account.points)}</p>
+        <div class="flex flex-wrap items-baseline gap-8">
+          {pointGroups.length > 0 ? (
+            pointGroups.map((group) => (
+              <div key={group.pointType}>
+                <p class="font-mono text-xs whitespace-nowrap text-base-content/60">{group.pointTypeName}</p>
+                <div class="font-mono text-4xl font-semibold tabular-nums tracking-tight">
+                  {pointsText(group.points)}
+                </div>
+              </div>
+            ))
+          ) : (
+            <div>
+              <p class="font-mono text-xs text-base-content/60">当前积分</p>
+              <div class="font-mono text-4xl font-semibold tabular-nums tracking-tight">0</div>
+            </div>
           )}
         </div>
         <div class="min-w-40 flex-1 basis-44">

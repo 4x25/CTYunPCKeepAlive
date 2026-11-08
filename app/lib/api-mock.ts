@@ -111,7 +111,7 @@ function expireIn(days: number): number {
 /* ── 种子数据 ─────────────────────────────────────────────── */
 
 function seedPoints(updatedAt = atTime('09:41:22')): PointsSummary {
-  /* 与真实账号一致：主数字只取 pointType=1，云智手机通用积分(500) 仅明细展示 */
+  /* 与真实账号一致：多个积分分组各自展示，不合并计数 */
   return {
     pointsList: [
       { pointType: 1, pointTypeName: '通用积分', points: 1280 },

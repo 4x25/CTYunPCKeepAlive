@@ -2,7 +2,7 @@
  * 积分与任务的数据聚合（backend-design §4.1）。
  *
  * - 积分：按 pointType 分组累加，过滤 `willOutDate` truthy 的「即将过期」行；
- *   主数字（pointType=1）由前端派生，后端只给全量分组（research §2.1）。
+ *   各积分分组由前端逐块展示，后端只给全量分组（research §2.1）。
  * - 任务：字段透传；`pointsList` 优先，`points` JSON 字符串仅作兜底（已在客户端归一化）。
  * - `isDisplayProgress` 实测恒为 null：只有明确 false 才视为「不展示进度」。
  */

@@ -3,7 +3,7 @@
  */
 import dayjs from 'dayjs/esm'
 import { TASK_DURATION_IDS, TASK_EXECUTABLE_IDS, TASK_UNSUPPORTED_REASON } from '../../shared/constants'
-import type { Account, PcInstance, PointTask, PointsSummary, TaskStatus } from '../../shared/types'
+import type { Account, PcInstance, PointTask, TaskStatus } from '../../shared/types'
 import { formatHms, maskOf } from '../../shared/utils'
 
 /** Tab 名：填了别名只显示别名，留空回落到完整账号 */
@@ -132,21 +132,8 @@ export function rewardOf(task: PointTask): number {
   return task.pointsList.reduce((sum, item) => sum + item.value, 0)
 }
 
-export function pointsTotal(summary: PointsSummary): number {
-  /* 主数字取「通用积分」(pointType=1)；云智手机通用积分(500) 等其它分组只在明细展示，不合并计数 */
-  const general = summary.pointsList.filter((item) => item.pointType === 1)
-  const list = general.length > 0 ? general : summary.pointsList
-  return list.reduce((sum, item) => sum + item.points, 0)
-}
-
-/** 主数字格式化：1280 → 1,280 */
 export function pointsText(value: number): string {
   return value.toLocaleString('en-US')
-}
-
-/** 分组小字：通用积分: 1,280 · 专属积分: 20 */
-export function pointsDetail(summary: PointsSummary): string {
-  return summary.pointsList.map((item) => `${item.pointTypeName}: ${pointsText(item.points)}`).join(' · ')
 }
 
 /** 今日任务完成度 */
