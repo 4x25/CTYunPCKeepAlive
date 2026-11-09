@@ -5,6 +5,7 @@ import { accountsRoute } from './routes/accounts'
 import { desktopsRoute } from './routes/desktops'
 import { logsRoute } from './routes/logs'
 import { pointsRoute } from './routes/points'
+import { tokenRoute } from './routes/token'
 
 /**
  * /api 子应用：在 app/server.ts 通过 `app.route('/api', apiApp)` 挂载。
@@ -18,6 +19,7 @@ apiApp.route('/', logsRoute)
 apiApp.route('/accounts', accountsRoute)
 apiApp.route('/accounts', desktopsRoute)
 apiApp.route('/accounts', pointsRoute)
+apiApp.route('/accounts', tokenRoute)
 
 /* 未匹配的 /api/* 属于路由层错误：HTTP 404 + 明确 msg；信封 code 归入请求错误段（10004），不用前端专用的 -1 */
 apiApp.all('*', (c) => c.json(err(ErrorCode.InvalidParam, `接口不存在：${c.req.method} ${c.req.path}`), 404))

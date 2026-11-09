@@ -2,9 +2,14 @@
  * 纯展示派生（frontend-design §4.3）：组件只调不改，所有函数不依赖浏览器 API。
  */
 import dayjs from 'dayjs/esm'
-import { TASK_DURATION_IDS, TASK_EXECUTABLE_IDS, TASK_UNSUPPORTED_REASON } from '../../shared/constants'
-import type { Account, PcInstance, PointTask, TaskStatus } from '../../shared/types'
-import { formatHms, maskOf } from '../../shared/utils'
+import {
+  TASK_DURATION_IDS,
+  TASK_EXECUTABLE_IDS,
+  TASK_UNSUPPORTED_REASON,
+  TOKEN_DAILY_TASK_ID,
+} from '../../shared/constants'
+import type { Account, PcInstance, PointTask, TaskStatus, TokenSummary, TokenTask } from '../../shared/types'
+import { formatHms, formatTokenCount, maskOf } from '../../shared/utils'
 
 /** Tab 名：填了别名只显示别名，留空回落到完整账号 */
 export function tabLabel(account: Account): string {
@@ -142,6 +147,90 @@ export function todayDone(tasks: PointTask[]): { done: number; total: number; ra
   const total = tasks.length
   return { done, total, ratio: total ? done / total : 0 }
 }
+
+/* ── 云智助手 Token ──────────────────────────────────────── */
+
+/** 可用 Token 展示（与上游「我的 Token」卡片同口径：万 / 亿） */
+export function tokenAvailableText(token: TokenSummary): string {
+  return formatTokenCount(token.remainTokens)
+}
+
+/** 「已消耗 / 共」文本 */
+export function tokenUsageText(token: TokenSummary): string {
+  return `已消耗 ${formatTokenCount(token.usedTokens)} / 共 ${formatTokenCount(token.totalTokens)}`
+}
+
+/** 用量进度 0–1（总量为 0 时归零） */
+export function tokenUsageRatio(token: TokenSummary): number {
+  if (!token.totalTokens) return 0
+  return Math.max(0, Math.min(1, token.usedTokens / token.totalTokens))
+}
+
+/** 任务进度：优先 currentProgress，连续签到 map 兜底（上游 currentProgress 可能延迟一天） */
+export function tokenTaskProgress(task: TokenTask): { current: number; total: number; ratio: number } {
+  const total =
+    task.totalProgress > 0
+      ? task.totalProgress
+      : Math.max(1, Object.keys(task.receiveProgressMap).length || 1)
+  const checked = Object.values(task.receiveProgressMap).filter((value) => value === 1).length
+  const current = Math.max(0, Math.min(total, Math.max(task.currentProgress, checked)))
+  return { current, total, ratio: total ? current / total : 0 }
+}
+
+/** 进度文本：默认「0 / 7 天」；明确不展示时为「—」 */
+export function tokenTaskProgressText(task: TokenTask): string {
+  if (task.isDisplayProgress === false) return '—'
+  const { current, total } = tokenTaskProgress(task)
+  return `${current} / ${total} 天`
+}
+
+/** 任务奖励文本：`+20万 Token` */
+export function tokenTaskRewardText(task: TokenTask): string {
+  const reward = task.pointsList.reduce((sum, item) => sum + item.value, 0)
+  return `+${formatTokenCount(reward)} Token`
+}
+
+/** Token 任务状态徽章 */
+export function tokenTaskStatusBadge(task: TokenTask): { label: string; cls: string } {
+  if (task.busy) return { label: '操作中', cls: 'badge-info' }
+  if (task.status === 3) return { label: '已失效', cls: 'badge-warning' }
+  if (task.status === 2) return { label: '已完成', cls: 'badge-success' }
+  if (task.status === 1) return { label: '发放中', cls: 'badge-success' }
+  if (task.canReceive) {
+    return { label: task.taskDefId === TOKEN_DAILY_TASK_ID ? '可签到' : '可领取', cls: 'badge-success' }
+  }
+  if (task.taskDefId === TOKEN_DAILY_TASK_ID) {
+    return { label: task.isSatisfiedCondition ? '已签到' : '未完成', cls: 'badge-neutral' }
+  }
+  return { label: '未达标', cls: 'badge-warning' }
+}
+
+/** Token 任务操作按钮：签到 / 领取 / 置灰态 */
+export function tokenTaskAction(task: TokenTask): { label: string; disabled: boolean; tip?: string } {
+  const daily = task.taskDefId === TOKEN_DAILY_TASK_ID
+  if (task.busy) return { label: daily ? '签到中…' : '领取中…', disabled: true, tip: '该任务正在操作中…' }
+  if (task.status === 2) return { label: '已完成', disabled: true, tip: '该任务已完成，无需重复操作' }
+  if (task.status === 3) return { label: '已失效', disabled: true, tip: '该任务已失效' }
+  if (task.status === 1) return { label: '发放中', disabled: true, tip: '奖励正在发放中，无需重复操作' }
+  if (task.canReceive) return { label: daily ? '签到' : '领取', disabled: false }
+  if (daily) {
+    return task.isSatisfiedCondition
+      ? { label: '已签到', disabled: true, tip: '今日已签到，明日 00:00 后重置' }
+      : { label: '未完成', disabled: true, tip: '任务条件尚未满足' }
+  }
+  return {
+    label: '未达标',
+    disabled: true,
+    tip: `需连续签到 ${tokenTaskProgress(task).total} 天，当前 ${tokenTaskProgress(task).current} 天`,
+  }
+}
+
+/** 避免重复数字符串；TokenPanel 与行内提示共用 */
+export function tokenTaskEmptyText(): string {
+  return '暂时无法获取 Token 任务列表 · 点右上角「刷新」重试'
+}
+
+/* ── 日志 ────────────────────────────────────────────────── */
 
 /** 日志时间列：完整 "YYYY-MM-DD HH:mm:ss" → "HH:mm:ss"（title 放全值） */
 export function logTime(t: string): string {

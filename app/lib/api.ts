@@ -2,6 +2,7 @@ import { ErrorCode, TIMEOUT_MS } from '../../shared/constants'
 import type {
   AddAccountResult,
   ApiEnvelope,
+  CheckinTokenTaskResult,
   CredentialsBody,
   DeleteAccountResult,
   DesktopsResult,
@@ -17,6 +18,7 @@ import type {
   SetDesktopAutoResult,
   SetTaskAutoResult,
   StateSnapshot,
+  TokenResult,
   UpdateCredentialsResult,
 } from '../../shared/types'
 import { ApiError } from './api-error'
@@ -24,7 +26,7 @@ import { mockApi } from './api-mock'
 
 export { ApiError, isApiError, isTimeout } from './api-error'
 
-/** 与 api.md §3 的 14 个接口一一对应；api-mock.ts 实现同一份签名 */
+/** 与 api.md §3 的 16 个接口一一对应；api-mock.ts 实现同一份签名 */
 export interface ApiClient {
   /** 4.1 全量快照 */
   getState(): Promise<StateSnapshot>
@@ -50,6 +52,10 @@ export interface ApiClient {
   runTask(userId: number, taskDefId: number): Promise<RunTaskResult>
   /** 4.12 切换任务自动开关 */
   setTaskAuto(userId: number, taskDefId: number, auto: boolean): Promise<SetTaskAutoResult>
+  /** 4.15 刷新云智助手 Token 用量与任务 */
+  getToken(userId: number): Promise<TokenResult>
+  /** 4.16 签到 / 领取 Token 任务 */
+  checkinTokenTask(userId: number, taskDefId: number): Promise<CheckinTokenTaskResult>
   /** 4.13 日志查询 */
   queryLogs(query: LogQuery): Promise<LogsResult>
   /** 4.14 清空界面日志 */
@@ -206,6 +212,14 @@ const realApi: ApiClient = {
     request<SetTaskAutoResult>('PATCH', `/accounts/${uid(userId)}/points/tasks/${tid(taskDefId)}`, {
       body: { auto },
       timeoutMs: TIMEOUT_MS.light,
+    }),
+
+  getToken: (userId) =>
+    request<TokenResult>('GET', `/accounts/${uid(userId)}/token`, { timeoutMs: TIMEOUT_MS.list }),
+
+  checkinTokenTask: (userId, taskDefId) =>
+    request<CheckinTokenTaskResult>('POST', `/accounts/${uid(userId)}/token/tasks/${tid(taskDefId)}/checkin`, {
+      timeoutMs: TIMEOUT_MS.list,
     }),
 
   queryLogs: (query) =>

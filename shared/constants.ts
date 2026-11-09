@@ -35,6 +35,12 @@ export const TASK_UNSUPPORTED_REASON: Record<number, string> = {
 /** 「使用1小时」类任务本期不实现自动执行，link 恒为 null（backend-design §4.2） */
 export const LINK_TOTAL_SECONDS = 3600
 
+/** 云智助手 Token 任务（网页固定下发两个任务） */
+export const TOKEN_DAILY_TASK_ID = 3001
+export const TOKEN_WEEKLY_TASK_ID = 3002
+/** getTaskList 的 displayTypes 固定值（Token 中心口径） */
+export const TOKEN_TASK_DISPLAY_TYPE = 5
+
 /* ── 枚举取值（路由层 zod 校验用） ───────────────────────── */
 
 export const LOG_LEVELS = ['DEBUG', 'INFO', 'WARN', 'ERROR'] as const

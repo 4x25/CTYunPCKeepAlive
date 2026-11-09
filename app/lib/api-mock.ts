@@ -17,10 +17,12 @@ import {
   MIN_INTERVAL_MINUTES,
   TASK_EXECUTABLE_IDS,
   TASK_UNSUPPORTED_REASON,
+  TOKEN_DAILY_TASK_ID,
 } from '../../shared/constants'
 import type {
   Account,
   AddAccountResult,
+  CheckinTokenTaskResult,
   CredentialsBody,
   DeleteAccountResult,
   DesktopsResult,
@@ -42,9 +44,12 @@ import type {
   SetDesktopAutoResult,
   SetTaskAutoResult,
   StateSnapshot,
+  TokenResult,
+  TokenSummary,
+  TokenTask,
   UpdateCredentialsResult,
 } from '../../shared/types'
-import { formatDateTime, isHm, maskOf, nowHm, nowStr } from '../../shared/utils'
+import { formatDateTime, formatTokenCount, isHm, maskOf, nowHm, nowStr } from '../../shared/utils'
 import type { ApiClient } from './api'
 import { ApiError } from './api-error'
 
@@ -169,6 +174,48 @@ function seedTasks(): PointTask[] {
   ]
 }
 
+function emptyToken(): TokenSummary {
+  return { totalTokens: 0, usedTokens: 0, expTokens: 0, remainTokens: 0, updatedDate: 0 }
+}
+
+function seedToken(updatedAt = atTime('09:41:22')): TokenSummary {
+  const totalTokens = 3_000_000
+  const usedTokens = 1_250_000
+  return {
+    totalTokens,
+    usedTokens,
+    expTokens: 0,
+    remainTokens: totalTokens - usedTokens,
+    updatedDate: updatedAt,
+  }
+}
+
+function tokenTask(
+  taskDefId: number,
+  taskDefName: string,
+  reward: number,
+  canReceive: boolean,
+): TokenTask {
+  return {
+    taskDefId,
+    taskDefName,
+    taskCalendarType: 57,
+    pointsList: [{ type: 600, typeDesc: 'TOKEN通用积分', value: reward }],
+    currentProgress: 0,
+    totalProgress: 7,
+    status: 0,
+    isDisplayProgress: true,
+    canReceive,
+    isSatisfiedCondition: true,
+    receiveProgressMap: { '1': 0, '2': 0, '3': 0, '4': 0, '5': 0, '6': 0, '7': 0 },
+    busy: false,
+  }
+}
+
+function seedTokenTasks(): TokenTask[] {
+  return [tokenTask(3001, '每日签到', 200_000, true), tokenTask(3002, '连续7天签到', 1_000_000, false)]
+}
+
 function seedPc(
   desktopId: string,
   desktopName: string,
@@ -259,6 +306,8 @@ function buildSeedState(): MockState {
         ],
         points: seedPoints(),
         tasks: seedTasks(),
+        token: seedToken(),
+        tokenTasks: seedTokenTasks(),
       },
       /* 日志的「对象」列只写实例名或任务名：ID 与密码一律不进日志 */
       logs: [
@@ -298,6 +347,8 @@ function buildSeedState(): MockState {
         ],
         points: seedPoints(),
         tasks: seedTasks(),
+        token: seedToken(),
+        tokenTasks: seedTokenTasks(),
       },
       logs: [
         { t: '14:41:02', lv: 'WARN', mod: '保活', msg: '测试机 C 保活失败：上游返回系统处理中（code=30010），本轮退避，下个周期重试' },
@@ -325,6 +376,8 @@ function buildSeedState(): MockState {
         pcs: [],
         points: emptyPoints(),
         tasks: [],
+        token: emptyToken(),
+        tokenTasks: [],
       },
       logs: [
         { t: '09:14:03', lv: 'ERROR', mod: '账号', msg: '177****8802 登录失败：账号或密码不正确（code=51010 INVALID_PASSWORD），该账号自动任务已挂起，等待用户修正凭据' },
@@ -349,6 +402,8 @@ function buildSeedState(): MockState {
         pcs: [],
         points: emptyPoints(),
         tasks: [],
+        token: emptyToken(),
+        tokenTasks: [],
       },
       logs: [
         { t: '09:12:40', lv: 'ERROR', mod: '账号', msg: '186****5140 登录被要求图形验证码（code=51085），工具不做自动重试，等待人工在官方客户端完成一次验证' },
@@ -372,6 +427,9 @@ function buildSeedState(): MockState {
         ],
         points: seedPoints(),
         tasks: seedTasks(),
+        /* 云智助手异常：Token 面板展示行内警示，任务不提供 */
+        token: emptyToken(),
+        tokenTasks: [],
       },
       logs: [
         { t: '09:06:30', lv: 'WARN', mod: '保活', msg: '辅助办公云电脑 自动保活本轮跳过：云智助手会话失效，正在自动重新登录，下个周期重试' },
@@ -445,6 +503,24 @@ function findTask(account: MockAccount, taskDefId: number): PointTask {
   return task
 }
 
+function findTokenTask(account: MockAccount, taskDefId: number): TokenTask {
+  const task = account.tokenTasks.find((t) => t.taskDefId === taskDefId)
+  if (!task) throw new ApiError(ErrorCode.TaskNotFound, '任务不存在，请刷新后重试')
+  return task
+}
+
+function cloneTokenResult(account: MockAccount, updatedDate = account.token.updatedDate): TokenResult {
+  return {
+    token: { ...account.token, updatedDate },
+    tasks: account.tokenTasks.map((task) => ({
+      ...task,
+      pointsList: task.pointsList.map((item) => ({ ...item })),
+      receiveProgressMap: { ...task.receiveProgressMap },
+    })),
+    updatedDate,
+  }
+}
+
 function appendLog(userId: number | null, lv: LogLevel, mod: LogModule, msg: string): LogEntry {
   const entry: LogEntry = { seq: ++state.seq, t: nowStr(), lv, mod, msg }
   if (userId == null) {
@@ -476,6 +552,12 @@ function toAccount(account: MockAccount): Account {
       pointsList: account.points.pointsList.map((item) => ({ ...item })),
     },
     tasks: account.tasks.map((task) => ({ ...task, pointsList: task.pointsList.map((item) => ({ ...item })) })),
+    token: { ...account.token },
+    tokenTasks: account.tokenTasks.map((task) => ({
+      ...task,
+      pointsList: task.pointsList.map((item) => ({ ...item })),
+      receiveProgressMap: { ...task.receiveProgressMap },
+    })),
   }
 }
 
@@ -646,6 +728,8 @@ export const mockApi: ApiClient = {
       pcs: demoPcs(),
       points: seedPoints(),
       tasks: seedTasks(),
+      token: seedToken(),
+      tokenTasks: seedTokenTasks(),
     }
     state.accounts.push(account)
     state.logs.set(userId, [])
@@ -696,6 +780,8 @@ export const mockApi: ApiClient = {
       pcs,
       points: previous.points,
       tasks: seedTasks(),
+      token: seedToken(),
+      tokenTasks: seedTokenTasks(),
     }
     applyAutoByPosition(account, toAccount(previous))
 
@@ -739,6 +825,8 @@ export const mockApi: ApiClient = {
     if (!account.pcs.length) account.pcs = demoPcs()
     if (!account.points.pointsList.length) account.points = seedPoints()
     if (!account.tasks.length) account.tasks = seedTasks()
+    if (!account.token.updatedDate) account.token = seedToken()
+    if (!account.tokenTasks.length) account.tokenTasks = seedTokenTasks()
     account.pcs.forEach((pc) => {
       if (pc.auto && isCountedRun(pc.run)) {
         pc.left = account.interval * 60
@@ -1010,6 +1098,64 @@ export const mockApi: ApiClient = {
     state.revision += 1
     appendLog(userId, 'INFO', '积分', `${task.taskDefName} 已${auto ? '开启' : '关闭'}自动执行`)
     return { revision: state.revision, taskDefId, auto } satisfies SetTaskAutoResult
+  },
+
+  async getToken(userId) {
+    const account = findAccount(userId)
+    if (account.banner) throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法获取云智助手 Token')
+    if (!account.eaichat.ok) {
+      throw new ApiError(ErrorCode.EaichatUnavailable, account.eaichat.msg ?? '云智助手会话不可用，Token 任务暂不可用')
+    }
+    await sleep(latency(240, 200))
+    const updatedDate = Date.now()
+    account.token = { ...account.token, updatedDate }
+    state.revision += 1
+    return cloneTokenResult(account, updatedDate)
+  },
+
+  async checkinTokenTask(userId, taskDefId) {
+    const account = findAccount(userId)
+    if (account.banner) throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法操作云智助手 Token 任务')
+    if (!account.eaichat.ok) {
+      throw new ApiError(ErrorCode.EaichatUnavailable, account.eaichat.msg ?? '云智助手会话不可用，Token 任务暂不可用')
+    }
+    const task = findTokenTask(account, taskDefId)
+    if (task.status === 3) throw new ApiError(ErrorCode.StateNotAllowed, '该任务已失效，无需操作')
+    if (task.status === 2) throw new ApiError(ErrorCode.StateNotAllowed, '该任务已完成，无需重复操作')
+    if (task.status === 1) throw new ApiError(ErrorCode.StateNotAllowed, '奖励正在发放中，无需重复操作')
+    if (task.busy) throw new ApiError(ErrorCode.StateNotAllowed, '该任务正在操作中，请稍候')
+    if (!task.canReceive) {
+      throw new ApiError(
+        ErrorCode.StateNotAllowed,
+        taskDefId === TOKEN_DAILY_TASK_ID ? '今日已签到，明日 00:00 后重置' : '任务未达标，暂不可领取',
+      )
+    }
+
+    task.busy = true
+    state.revision += 1
+    await sleep(latency(500, 350))
+
+    const reward = task.pointsList.reduce((sum, item) => sum + item.value, 0)
+    task.busy = false
+    task.status = 2
+    task.canReceive = false
+    task.currentProgress = Math.min(task.totalProgress, task.currentProgress + 1)
+    task.receiveProgressMap[String(task.currentProgress)] = 1
+    account.token = {
+      ...account.token,
+      totalTokens: account.token.totalTokens + reward,
+      remainTokens: account.token.remainTokens + reward,
+      updatedDate: Date.now(),
+    }
+    state.revision += 1
+    appendLog(
+      userId,
+      'INFO',
+      '积分',
+      `${task.taskDefName} ${taskDefId === TOKEN_DAILY_TASK_ID ? '签到' : '领取'}成功 · 获得 ${formatTokenCount(reward)} Token · 奖励预计 1 分钟内到账`,
+    )
+    const result = cloneTokenResult(account)
+    return { revision: state.revision, taskDefId, ok: true, ...result } satisfies CheckinTokenTaskResult
   },
 
   async queryLogs(query: LogQuery) {

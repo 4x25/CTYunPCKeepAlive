@@ -13,8 +13,11 @@ import type {
   PcInstance,
   PointTask,
   PointsSummary,
+  TokenSummary,
+  TokenTask,
 } from '../../shared/types'
-import { maskOf, nowHm } from '../../shared/utils'
+import { TOKEN_DAILY_TASK_ID } from '../../shared/constants'
+import { formatTokenCount, maskOf, nowHm } from '../../shared/utils'
 import {
   CtyunClient,
   type CtyunDesktop,
@@ -30,6 +33,13 @@ import {
 import { UpstreamError, classifyLoginFailure, manualVerifyLabel, upstreamMessage } from '../upstream/errors'
 import type { PersistedAccount } from '../store/config'
 import { aggregatePoints, toPointTask } from './points'
+import {
+  emptyTokenSummary,
+  toTokenTask,
+  tokenRewardOf,
+  tokenUsageSummary,
+  type TokenSnapshot,
+} from './token'
 
 const EAI_RENEW_CHECK_MS = 12 * 60 * 60 * 1000
 /** 登录链路整体预算：negotiate + login + eaichat 共享（backend-design §2.1） */
@@ -101,6 +111,14 @@ export class AccountSession {
   private tasksRefresh: Promise<PointTask[]> | null = null
   /** 任务执行中（手动 4.11 / 自动编排共用）：同 taskDefId 天然互斥 */
   private runningTasks = new Set<number>()
+
+  /* 云智助手 Token：与云电脑积分完全独立的一套任务数据 */
+  private token: TokenSummary = emptyTokenSummary()
+  private tokenTasks: TokenTask[] = []
+  /** Token 用量 + 任务列表刷新单飞 */
+  private tokenRefresh: Promise<TokenSnapshot> | null = null
+  /** 签到 / 领取在途（taskDefId 互斥） */
+  private tokenRunning = new Set<number>()
   private ctyun: CtyunClient | null = null
   private eai: EaiChatClient | null = null
   private profile: CtyunLoginProfile | null = null
@@ -175,6 +193,11 @@ export class AccountSession {
 
   get isEaichatReady(): boolean {
     return this.eaichatOk
+  }
+
+  /** 云智助手不可用的原因文案（Token 面板行内警示用） */
+  get eaichatMessage(): string | null {
+    return this.eaichatMsg
   }
 
   /**
@@ -279,7 +302,16 @@ export class AccountSession {
     this.eaichatOk = false
     this.eaichatMsg = null
     this.eaichatManual = null
+    this.resetTokenState()
     this.touch()
+  }
+
+  /** 重新登录 / 会话失效时清掉 Token 缓存，避免展示上一次会话的数据 */
+  private resetTokenState(): void {
+    this.token = emptyTokenSummary()
+    this.tokenTasks = []
+    this.tokenRefresh = null
+    this.tokenRunning.clear()
   }
 
   /**
@@ -327,6 +359,7 @@ export class AccountSession {
     this.stopEaichatRenewal()
     const stale = this.eai
     this.eai = null
+    this.resetTokenState()
     void stale?.logout()
     this.touch()
     return this.eaichatMsg
@@ -369,6 +402,7 @@ export class AccountSession {
     this.tasks = []
     this.runningTasks.clear()
     this.points = emptyPoints()
+    this.resetTokenState()
     /* 登录失败：该账号的自动保活计划与过渡态追踪一并取消 */
     this.deps.disposed()
     this.touch()
@@ -400,19 +434,20 @@ export class AccountSession {
    * 积分 + 任务刷新（4.10 用）：同一账号同一时刻只发一次上游请求。
    * 先拉任务再拉积分（两者都是明文 GET，串行避免瞬时并发）；
    * 拉取失败原样抛出，由调用方决定错误信封（4.10）或顺延（自动编排）。
+   * `options.log=false`：4.10 用户手动「刷新任务」不写静默刷新 INFO（前端已有反馈）。
    */
-  refreshPoints(): Promise<PointsSnapshot> {
+  refreshPoints(options: { log?: boolean } = {}): Promise<PointsSnapshot> {
     if (this.pointsRefresh) return this.pointsRefresh
-    const run = this.doRefreshPoints().finally(() => {
+    const run = this.doRefreshPoints(options).finally(() => {
       if (this.pointsRefresh === run) this.pointsRefresh = null
     })
     this.pointsRefresh = run
     return run
   }
 
-  private async doRefreshPoints(): Promise<PointsSnapshot> {
+  private async doRefreshPoints(options: { log?: boolean }): Promise<PointsSnapshot> {
     /* 复用任务列表的单飞：4.10 与编排复查并发时只打一次 getTaskList */
-    await this.refreshTasks()
+    await this.refreshTasks(options)
     const rows: CtyunPointRow[] = await this.requireCtyun().getUserPoints()
     this.points = aggregatePoints(rows)
     this.touch()
@@ -422,22 +457,36 @@ export class AccountSession {
   /**
    * 只拉任务列表（任务编排的「复查」）：任务状态才是执行依据，
    * 不因积分概览接口抖动而误判复查失败。同一账号同一时刻只发一次请求。
+   * 非用户手动触发（登录 / 启动恢复 / 任务执行后 5s·15s 复查）默认写一条静默刷新 INFO。
    */
-  refreshTasks(): Promise<PointTask[]> {
+  refreshTasks(options: { log?: boolean } = {}): Promise<PointTask[]> {
     if (this.tasksRefresh) return this.tasksRefresh
-    const run = this.doRefreshTasks().finally(() => {
+    const run = this.doRefreshTasks(options).finally(() => {
       if (this.tasksRefresh === run) this.tasksRefresh = null
     })
     this.tasksRefresh = run
     return run
   }
 
-  private async doRefreshTasks(): Promise<PointTask[]> {
+  private async doRefreshTasks(options: { log?: boolean }): Promise<PointTask[]> {
+    const startedAt = Date.now()
     const client = this.requireCtyun()
     const tasks = await client.getTaskList()
     this.applyTaskList(tasks)
     this.touch()
-    return this.pointsSnapshot().tasks
+    const snapshot = this.pointsSnapshot().tasks
+    if (options.log !== false) {
+      const done = snapshot.filter((task) => task.status === 2).length
+      this.deps.log(
+        'INFO',
+        '积分',
+        `静默刷新积分任务状态 · 共 ${snapshot.length} 个任务（已完成 ${done}）· 耗时 ${Math.max(
+          0,
+          Date.now() - startedAt,
+        )}ms`,
+      )
+    }
+    return snapshot
   }
 
   private requireCtyun(): CtyunClient {
@@ -513,6 +562,109 @@ export class AccountSession {
     this.runningTasks.delete(taskDefId)
     this.syncTaskFlags()
     this.touch()
+  }
+
+  /* ── 云智助手 Token（与云电脑积分独立） ──────────────────── */
+
+  private requireEaichat(): EaiChatClient {
+    if (!this.eai) throw new UpstreamError(40010, '云智助手未登录')
+    return this.eai
+  }
+
+  /** 拉取 Token 用量 + 任务列表（4.15 与签到后的复查共用，单飞） */
+  refreshToken(): Promise<TokenSnapshot> {
+    if (this.tokenRefresh) return this.tokenRefresh
+    const run = this.doRefreshToken().finally(() => {
+      if (this.tokenRefresh === run) this.tokenRefresh = null
+    })
+    this.tokenRefresh = run
+    return run
+  }
+
+  private async doRefreshToken(): Promise<TokenSnapshot> {
+    const client = this.requireEaichat()
+    /* 先任务后用量：先确认任务状态，再更新面板数字；任一失败都不落地半套数据 */
+    const tasks = await client.getTokenTasks()
+    const usage = await client.getTokenUsage()
+    /* 期间发生过重登/会话失效：丢弃旧会话的响应，避免污染新会话的 Token 缓存 */
+    if (this.eai !== client) return this.tokenSnapshot()
+    this.token = tokenUsageSummary(usage)
+    this.tokenTasks = tasks.map((task) => toTokenTask(task, this.tokenRunning.has(task.taskDefId)))
+    this.touch()
+    return this.tokenSnapshot()
+  }
+
+  tokenSnapshot(): TokenSnapshot {
+    return {
+      token: { ...this.token },
+      tasks: this.tokenTasks.map((task) => ({
+        ...task,
+        pointsList: task.pointsList.map((item) => ({ ...item })),
+        receiveProgressMap: { ...task.receiveProgressMap },
+      })),
+      updatedDate: this.token.updatedDate,
+    }
+  }
+
+  findTokenTask(taskDefId: number): TokenTask | undefined {
+    return this.tokenTasks.find((task) => task.taskDefId === taskDefId)
+  }
+
+  isTokenTaskRunning(taskDefId: number): boolean {
+    return this.tokenRunning.has(taskDefId)
+  }
+
+  private syncTokenFlags(): void {
+    this.tokenTasks = this.tokenTasks.map((task) => ({
+      ...task,
+      busy: this.tokenRunning.has(task.taskDefId),
+    }))
+  }
+
+  beginTokenTaskRun(taskDefId: number): boolean {
+    if (this.tokenRunning.has(taskDefId)) return false
+    this.tokenRunning.add(taskDefId)
+    this.syncTokenFlags()
+    this.touch()
+    return true
+  }
+
+  endTokenTaskRun(taskDefId: number): void {
+    if (!this.tokenRunning.delete(taskDefId)) return
+    this.syncTokenFlags()
+    this.touch()
+  }
+
+  /**
+   * 签到 / 领取（同一个上游接口）：成功后立即复查 Token 用量与任务状态。
+   * 复查失败不回滚签到成功，只记 WARN，由前端稍后再拉 4.15 补上数字。
+   */
+  async checkinTokenTask(taskDefId: number): Promise<TokenSnapshot> {
+    const client = this.requireEaichat()
+    const task = this.findTokenTask(taskDefId)
+    if (!task) throw new UpstreamError(-1, '任务不存在')
+    if (!this.beginTokenTaskRun(taskDefId)) throw new UpstreamError(-1, '任务正在操作中')
+
+    try {
+      await client.checkinTokenTask(taskDefId, task.currentProgress)
+      const reward = tokenRewardOf(task)
+      const action = taskDefId === TOKEN_DAILY_TASK_ID ? '签到' : '领取'
+      this.deps.log(
+        'INFO',
+        '积分',
+        `${task.taskDefName} ${action}成功 · 获得 ${formatTokenCount(reward)} Token · 奖励预计 1 分钟内到账`,
+      )
+      try {
+        await this.refreshToken()
+      } catch (error) {
+        if (error instanceof UpstreamError && error.code === 40010) this.markEaichatFailure(error)
+        this.deps.log('WARN', '积分', `${task.taskDefName} ${action}成功，但 Token 用量复查失败，稍后自动重试`)
+      }
+      this.endTokenTaskRun(taskDefId)
+      return this.tokenSnapshot()
+    } finally {
+      this.endTokenTaskRun(taskDefId)
+    }
   }
 
   /* ── 云电脑列表 ─────────────────────────────────────────── */
@@ -715,6 +867,12 @@ export class AccountSession {
         ...task,
         pointsList: task.pointsList.map((item) => ({ ...item })),
       })),
+      token: { ...this.token },
+      tokenTasks: this.tokenTasks.map((task) => ({
+        ...task,
+        pointsList: task.pointsList.map((item) => ({ ...item })),
+        receiveProgressMap: { ...task.receiveProgressMap },
+      })),
     }
   }
 
@@ -752,6 +910,7 @@ export class AccountSession {
     this.pointsRefresh = null
     this.tasksRefresh = null
     this.runningTasks.clear()
+    this.resetTokenState()
     void ctyun?.logout()
     void eai?.logout()
     this.deps.disposed()

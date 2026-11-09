@@ -85,6 +85,43 @@ export interface PointTask {
   auto: boolean
 }
 
+/** 云智助手 Token 用量概览（Token 中心「我的 Token」卡片） */
+export interface TokenSummary {
+  /** 已发放/购买的 Token 总量 */
+  totalTokens: number
+  /** 已消耗 Token */
+  usedTokens: number
+  /** 即将过期 Token（上游返回，当前页面不展示） */
+  expTokens: number
+  /** 当前可用 Token */
+  remainTokens: number
+  /** 最近一次拉取成功时间 */
+  updatedDate: number
+}
+
+/** 云智助手 Token 任务（与云电脑积分任务分开维护） */
+export interface TokenTask {
+  taskDefId: number
+  taskDefName: string
+  /** 5 每日 3 每周 2 每月 1 每年 0 长期 */
+  taskCalendarType: number
+  /** 奖励明细（type 600 = TOKEN 通用积分） */
+  pointsList: TaskReward[]
+  currentProgress: number
+  totalProgress: number
+  status: TaskStatus
+  /** false 时进度列显示「—」 */
+  isDisplayProgress: boolean | null
+  /** 当前是否可签到 / 领取 */
+  canReceive: boolean
+  /** 任务条件是否已满足 */
+  isSatisfiedCondition: boolean
+  /** 连续签到进度：key 为 "1".."7"，1 = 当天已签到 */
+  receiveProgressMap: Record<string, number>
+  /** 签到 / 领取操作在途 */
+  busy: boolean
+}
+
 /** 云电脑实例（api.md §2.2） */
 export interface PcInstance {
   /** 上游 desktopId；前端操作寻址用 */
@@ -132,6 +169,10 @@ export interface Account {
   pcs: PcInstance[]
   points: PointsSummary
   tasks: PointTask[]
+  /** 云智助手 Token 用量概览 */
+  token: TokenSummary
+  /** 云智助手 Token 任务 */
+  tokenTasks: TokenTask[]
 }
 
 /** 日志（api.md §2.5） */
@@ -279,6 +320,25 @@ export interface SetTaskAutoResult {
   revision: number
   taskDefId: number
   auto: boolean
+}
+
+/** 4.15 GET /api/accounts/:userId/token */
+export interface TokenResult {
+  token: TokenSummary
+  tasks: TokenTask[]
+  updatedDate: number
+}
+
+/** 4.16 POST /api/accounts/:userId/token/tasks/:taskDefId/checkin */
+export interface CheckinTokenTaskResult {
+  revision: number
+  taskDefId: number
+  /** 上游签到 / 领取是否成功 */
+  ok: boolean
+  /** 操作后的最新用量与任务（上游复查失败时为操作前的缓存值） */
+  token: TokenSummary
+  tasks: TokenTask[]
+  updatedDate: number
 }
 
 /** 4.13 GET /api/logs */

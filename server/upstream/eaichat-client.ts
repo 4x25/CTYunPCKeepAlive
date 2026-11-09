@@ -8,6 +8,7 @@
  * 会话密钥 sk / JWT / cookie 只在内存中，不落日志、不持久化。
  */
 import crypto from 'node:crypto'
+import { TOKEN_TASK_DISPLAY_TYPE } from '../../shared/constants'
 import { aesEcbDecrypt, md5, randomAlphaNum, randomPrintable, rsaEncryptPkcs1Hex, sha256 } from './crypto'
 import { UpstreamError, UpstreamNetworkError } from './errors'
 
@@ -41,6 +42,33 @@ type JsonRecord = Record<string, unknown>
 
 function isRecord(value: unknown): value is JsonRecord {
   return typeof value === 'object' && value !== null
+}
+
+function toNumber(value: unknown): number {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function toStringValue(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
+/** 任务响应外层是 `{resultCode, data:{code, data:[...]}}`；只把内层 data 交给业务层 */
+function nestedData(json: JsonRecord, what: string): unknown {
+  if (Number(json.resultCode) !== 0) throw new UpstreamError(-1, `云智助手${what}失败`)
+  const outer = isRecord(json.data) ? json.data : {}
+  if (Number(outer.code) !== 0) {
+    const msg = typeof outer.msg === 'string' && outer.msg ? outer.msg : `云智助手${what}失败`
+    throw new UpstreamError(-1, msg)
+  }
+  return outer.data
+}
+
+/** 上游 isDisplayProgress 可能是 null / boolean / 0|1；只有明确 false 才隐藏 */
+function normalizeDisplayProgress(value: unknown): boolean | null {
+  if (value === false || value === 0) return false
+  if (value == null) return null
+  return true
 }
 
 /** CookieJar：上游 Cookie 有 Domain=.ctyun.cn / Path=/ 等约束，不能只存 name=value */
@@ -135,6 +163,30 @@ export interface EaiChatUserInfo {
   vipType: string | null
   iamUid: string | null
   raw: JsonRecord
+}
+
+/** Token 中心用量（`platform/cp/usage/summry`，上游拼写就是 summry） */
+export interface EaiTokenUsage {
+  totalTokens: number
+  usedTokens: number
+  expTokens: number
+  remainTokens: number
+}
+
+/** Token 中心任务（`userPoints/getTaskList?displayTypes=5`） */
+export interface EaiTokenTask {
+  taskDefId: number
+  taskDefName: string
+  taskCalendarType: number
+  pointsList: Array<{ type: number; typeDesc: string; value: number }>
+  currentProgress: number
+  totalProgress: number
+  status: number
+  isDisplayProgress: boolean | null
+  canReceive: boolean
+  isSatisfiedCondition: boolean
+  receiveProgressMap: Record<string, number>
+  taskSort: number
 }
 
 export interface EaiChatResult {
@@ -489,6 +541,87 @@ export class EaiChatClient {
       vipType: typeof data.vipType === 'string' ? data.vipType : null,
       iamUid: typeof data.iamUid === 'string' ? data.iamUid : null,
       raw: data,
+    }
+  }
+
+  /* ── Token 中心（与云电脑积分任务独立） ───────────────────── */
+
+  /**
+   * 我的 Token 用量。上游路径固定为 `platform/cp/usage/summry`（拼写即如此）。
+   * 返回字段全部转数字，避免上游下发字符串导致前端计算异常。
+   */
+  async getTokenUsage(): Promise<EaiTokenUsage> {
+    const json = await this.api('/ai/portal/wenc/v1/platform/cp/usage/summry')
+    if (Number(json.resultCode) !== 0) throw new UpstreamError(-1, '云智助手 Token 用量获取失败')
+    const data = isRecord(json.data) ? json.data : {}
+    const totalTokens = toNumber(data.totalTokens)
+    const usedTokens = toNumber(data.usedTokens)
+    const expTokens = toNumber(data.expTokens)
+    const remainTokens =
+      data.remainTokens === undefined || data.remainTokens === null
+        ? Math.max(0, totalTokens - usedTokens - expTokens)
+        : toNumber(data.remainTokens)
+    return { totalTokens, usedTokens, expTokens, remainTokens }
+  }
+
+  /**
+   * Token 任务列表（`displayTypes=5`）。外层同样包一层 `{code,data}`，
+   * 只有 code=0 且内层是数组时才认为成功；按 taskSort 升序返回。
+   */
+  async getTokenTasks(): Promise<EaiTokenTask[]> {
+    const json = await this.api('/ai/portal/wenc/v1/cp/mgr/api/openApi/marketing/api/userPoints/getTaskList', {
+      params: { displayTypes: TOKEN_TASK_DISPLAY_TYPE },
+    })
+    const rows = nestedData(json, 'Token 任务列表获取')
+    if (!Array.isArray(rows)) throw new UpstreamError(-1, '云智助手 Token 任务列表为空')
+    const tasks: EaiTokenTask[] = []
+    for (const value of rows) {
+      if (!isRecord(value)) continue
+      const pointsList = Array.isArray(value.pointsList)
+        ? value.pointsList.filter(isRecord).map((item) => ({
+            type: toNumber(item.type),
+            typeDesc: toStringValue(item.typeDesc),
+            value: toNumber(item.value),
+          }))
+        : []
+      const receiveProgressMap: Record<string, number> = {}
+      if (isRecord(value.receiveProgressMap)) {
+        for (const [day, checked] of Object.entries(value.receiveProgressMap)) {
+          receiveProgressMap[day] = toNumber(checked)
+        }
+      }
+      tasks.push({
+        taskDefId: toNumber(value.taskDefId),
+        taskDefName: toStringValue(value.taskDefName),
+        taskCalendarType: toNumber(value.taskCalendarType),
+        pointsList,
+        currentProgress: toNumber(value.currentProgress),
+        totalProgress: toNumber(value.totalProgress),
+        status: toNumber(value.status),
+        isDisplayProgress: normalizeDisplayProgress(value.isDisplayProgress),
+        canReceive: value.canReceive === true,
+        isSatisfiedCondition: value.isSatisfiedCondition === true,
+        receiveProgressMap,
+        taskSort: toNumber(value.taskSort),
+      })
+    }
+    return tasks.sort((a, b) => a.taskSort - b.taskSort)
+  }
+
+  /**
+   * 签到 / 领取（同一个上游接口）：`receivePointsV2?taskDefId=&progress=`。
+   * 上游成功时 `data.data === true`；其它情况视为业务拒绝。
+   */
+  async checkinTokenTask(taskDefId: number, progress: number): Promise<void> {
+    const json = await this.api(
+      '/ai/portal/wenc/v1/cp/mgr/api/openApi/marketing/api/userPoints/receivePointsV2',
+      { params: { taskDefId, progress } },
+    )
+    if (Number(json.resultCode) !== 0) throw new UpstreamError(-1, '云智助手签到失败')
+    const outer = isRecord(json.data) ? json.data : {}
+    if (Number(outer.code) !== 0 || outer.data !== true) {
+      const msg = typeof outer.msg === 'string' && outer.msg ? outer.msg : '云智助手签到失败'
+      throw new UpstreamError(-1, msg)
     }
   }
 

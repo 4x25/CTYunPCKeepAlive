@@ -36,6 +36,15 @@ export function maskOf(acct: string): string {
   return acct.slice(0, 2) + '****' + acct.slice(-2)
 }
 
+/** Token 数量展示：按「万 / 亿」压缩，去掉多余小数（200000 → 20万） */
+export function formatTokenCount(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0'
+  const trim = (n: number) => n.toFixed(2).replace(/\.?0+$/, '')
+  if (value >= 100_000_000) return `${trim(value / 100_000_000)}亿`
+  if (value >= 10_000) return `${trim(value / 10_000)}万`
+  return value.toLocaleString('en-US')
+}
+
 /** "HH:mm" 格式校验（积分时间窗口用） */
 export function isHm(value: string): boolean {
   return /^([01]\d|2[0-3]):[0-5]\d$/.test(value)

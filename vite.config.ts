@@ -4,6 +4,8 @@ import tailwindcss from '@tailwindcss/vite'
 import honox from 'honox/vite'
 import { defineConfig } from 'vite'
 
+const port = 3000
+
 export default defineConfig({
   plugins: [
     honox({
@@ -11,6 +13,16 @@ export default defineConfig({
       client: { input: ['/app/client.ts', '/app/style.css'] }
     }),
     tailwindcss(),
-    build()
+    build({
+      port,
+      /* 覆盖默认的 serve 调用，在监听成功后输出访问地址 */
+      entryContentAfterHooks: [
+        (appName) => `import { serve } from '@hono/node-server'
+
+serve({ fetch: ${appName}.fetch, port: ${port} }, (info) => {
+  console.log(\`\\nServer running at http://localhost:\${info.port}\`)
+})`
+      ]
+    })
   ]
 })

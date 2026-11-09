@@ -22,6 +22,7 @@ import EmptyAccountPanel from '../components/EmptyAccountPanel'
 import SubTabs, { type TabKey } from '../components/SubTabs'
 import KeepAlivePanel from '../components/KeepAlivePanel'
 import PointsPanel from '../components/PointsPanel'
+import TokenPanel from '../components/TokenPanel'
 import LogPanel from '../components/LogPanel'
 import ModalLayer from '../components/ModalLayer'
 import ToastStack from '../components/ToastStack'
@@ -73,6 +74,7 @@ const desktopHold = (userId: number, desktopId: string) => `pc:${desktopKey(user
 const accountHold = (userId: number) => `account:${userId}`
 const taskAutoHold = (userId: number, taskDefId: number) => `task-auto:${taskKey(userId, taskDefId)}`
 const taskRunHold = (userId: number, taskDefId: number) => `task-run:${taskKey(userId, taskDefId)}`
+const tokenTaskKey = (userId: number, taskDefId: number) => `token:${taskKey(userId, taskDefId)}`
 
 interface PendingFetch {
   minRevision?: number
@@ -106,6 +108,9 @@ export default function KeepAliveApp() {
   const [refreshingPoints, setRefreshingPoints] = useState<Record<number, boolean>>({})
   /* 4.10 返回 30060（设备未绑定）的账号：仅前端内存态，成功拉取后清除 */
   const [pointsDeviceUnbound, setPointsDeviceUnbound] = useState<Record<number, boolean>>({})
+  /* 云智助手 Token：刷新在途 / 签到在途（键为 `userId:taskDefId`） */
+  const [refreshingToken, setRefreshingToken] = useState<Record<number, boolean>>({})
+  const [busyTokenTask, setBusyTokenTask] = useState<Record<string, boolean>>({})
   const [justOkPc, setJustOkPc] = useState<Record<string, boolean>>({})
   /* busyDesktop / busyTask 是同一资源的唯一在途标记：手动保活与自动开关共用前者，任务执行与任务开关共用后者 */
   const [busyDesktop, setBusyDesktop] = useState<Record<string, boolean>>({})
@@ -139,6 +144,8 @@ export default function KeepAliveApp() {
   const lastStateAtRef = useRef(0)
   const refreshingRef = useRef<Set<number>>(new Set())
   const pointsRefreshingRef = useRef<Set<number>>(new Set())
+  const tokenRefreshingRef = useRef<Set<number>>(new Set())
+  const busyTokenTaskRef = useRef<Set<string>>(new Set())
   const clearArmedAtRef = useRef<Record<number, number>>({})
   const toastIdRef = useRef(0)
   const zeroSinceRef = useRef<number | null>(null)
@@ -607,6 +614,13 @@ export default function KeepAliveApp() {
     return () => clearInterval(id)
   }, [transitional])
 
+  /* 进入 Token 页签 / 切到另一个账号时拉一次 4.15；云智助手不可用时只展示行内警示 */
+  const activeEaichatReady = accounts.find((account) => account.userId === activeUid)?.eaichat.ok ?? false
+  useEffect(() => {
+    if (!ready || tab !== 'token' || activeUid == null || !activeEaichatReady) return
+    void onRefreshToken(activeUid)
+  }, [ready, tab, activeUid, activeEaichatReady])
+
   /* 日志：切页签 / 切账号 / 筛选变化 → 激活账号拉一次（关键字 300ms debounce）
      - 切回日志页签 → changeTab 已清掉指纹，这里走全量校准；
      - 停留在日志页签内切账号 → 口径没变走增量补课，口径变了全量重拉。 */
@@ -1067,6 +1081,72 @@ export default function KeepAliveApp() {
     })
   }
 
+  /* ── 云智助手 Token ───────────────────────────────────────── */
+  function applyTokenResult(userId: number, result: Awaited<ReturnType<typeof api.getToken>>) {
+    patchAccount(userId, (account) => ({ ...account, token: result.token, tokenTasks: result.tasks }))
+  }
+
+  async function onRefreshToken(userId: number) {
+    if (tokenRefreshingRef.current.has(userId)) return
+    tokenRefreshingRef.current.add(userId)
+    setRefreshingToken((prev) => ({ ...prev, [userId]: true }))
+    try {
+      const result = await api.getToken(userId)
+      applyTokenResult(userId, result)
+      /* 4.15 响应没有 revision：追加一次 4.1，防止更旧的快照覆盖 token/tokenTasks */
+      void fetchState(undefined, true)
+    } catch (error) {
+      handleError(error)
+    } finally {
+      tokenRefreshingRef.current.delete(userId)
+      setRefreshingToken((prev) => withoutKey(prev, userId))
+    }
+  }
+
+  /**
+   * 签到成功后的静默复查：上游奖励通常 1 分钟内到账，按网页节奏跟两次；
+   * 不占「刷新 Token」的 busy，也不弹错误 Toast（失败交给手动刷新兜底）。
+   */
+  function scheduleTokenFollowUp(userId: number) {
+    const tick = async () => {
+      if (!accountsRef.current.some((account) => account.userId === userId)) return
+      try {
+        const result = await api.getToken(userId)
+        applyTokenResult(userId, result)
+        void fetchState(undefined, true)
+      } catch {
+        /* 静默：可视刷新与手动刷新兜底 */
+      }
+    }
+    setTimeout(() => void tick(), 4_000)
+    setTimeout(() => void tick(), 16_000)
+  }
+
+  async function onCheckinTokenTask(userId: number, taskDefId: number) {
+    const key = tokenTaskKey(userId, taskDefId)
+    if (busyTokenTaskRef.current.has(key)) return
+    const account = accountsRef.current.find((item) => item.userId === userId)
+    if (!account?.tokenTasks.some((task) => task.taskDefId === taskDefId)) return
+
+    busyTokenTaskRef.current.add(key)
+    setBusyTokenTask((prev) => ({ ...prev, [key]: true }))
+    let accepted = false
+    try {
+      const epoch = bootIdRef.current
+      const result = await api.checkinTokenTask(userId, taskDefId)
+      accepted = true
+      noteRevision(result.revision, epoch)
+      applyTokenResult(userId, result)
+      fetchAfterWrite(result.revision, epoch)
+    } catch (error) {
+      handleError(error)
+    } finally {
+      if (accepted) scheduleTokenFollowUp(userId)
+      busyTokenTaskRef.current.delete(key)
+      setBusyTokenTask((prev) => withoutKey(prev, key))
+    }
+  }
+
   /* ── 日志：清空 / 导出 ───────────────────────────────────── */
   function resetClearArmed(userId: number) {
     delete clearArmedAtRef.current[userId]
@@ -1212,6 +1292,19 @@ export default function KeepAliveApp() {
               onWindowCommit={(winStart, winEnd) => onWindowCommit(account.userId, winStart, winEnd)}
               onRefresh={() => {
                 void onRefreshPoints(account.userId)
+              }}
+            />
+          ),
+          token: (
+            <TokenPanel
+              account={account}
+              refreshing={!!refreshingToken[account.userId]}
+              busyTask={busyTokenTask}
+              onCheckin={(taskDefId) => {
+                void onCheckinTokenTask(account.userId, taskDefId)
+              }}
+              onRefresh={() => {
+                void onRefreshToken(account.userId)
               }}
             />
           ),

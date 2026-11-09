@@ -17,6 +17,8 @@ export type {
   PointTask,
   RunState,
   StateSnapshot,
+  TokenSummary,
+  TokenTask,
 } from '../../shared/types'
 
 /** 弹窗：新增 / 修正凭据（editUid 非空） / 删除确认 */

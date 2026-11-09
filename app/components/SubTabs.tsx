@@ -1,10 +1,11 @@
 import { Fragment, type Child } from 'hono/jsx'
 
-export type TabKey = 'keepalive' | 'points' | 'log'
+export type TabKey = 'keepalive' | 'points' | 'token' | 'log'
 
 const TABS: Array<{ key: TabKey; label: string }> = [
   { key: 'keepalive', label: '无感保活' },
   { key: 'points', label: '积分任务' },
+  { key: 'token', label: '云智助手 Token' },
   { key: 'log', label: '运行日志' },
 ]
 
@@ -17,7 +18,7 @@ interface Props {
   name: string
 }
 
-/** 功能页签（官网 radio tabs-box + tab content 结构）：保活 / 积分任务 / 日志 */
+/** 功能页签（官网 radio tabs-box + tab content 结构）：保活 / 积分任务 / Token / 日志 */
 export default function SubTabs({ tab, onChange, panels, name }: Props) {
   return (
     <div class="tabs tabs-box h-full rounded-none shadow-none" aria-label="功能页">

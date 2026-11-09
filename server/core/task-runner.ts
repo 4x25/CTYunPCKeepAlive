@@ -36,6 +36,15 @@ const MIN_SCHEDULE_DELAY_MS = 1_000
 
 type RoundOutcome = 'done' | 'retry'
 
+/** 自动轮次的完整结果：收口时据此写「今日已完成 / 无可执行任务」的排程日志 */
+interface RoundResult {
+  outcome: RoundOutcome
+  /** 正常收口（需要写收口日志）；false = 已由更具体的日志说明（如需人工验证） */
+  closed: boolean
+  /** 本轮确认完成的自动任务名 */
+  executed: string[]
+}
+
 interface Plan {
   session: AccountSession
   timer: ReturnType<typeof setTimeout> | null
@@ -311,23 +320,23 @@ export class TaskRunner {
       this.plans.delete(session)
       return
     }
-    /* 当天已收口（或被反复调度）：直接排次日 */
+    /* 当天已收口（或被反复调度）：直接排次日，不再重复写收口日志 */
     if (plan.doneDay === dayKey()) {
       this.scheduleNext(plan)
       return
     }
 
     plan.inFlight = true
-    let outcome: RoundOutcome
+    let result: RoundResult
     try {
-      outcome = await this.runAutoRound(session)
+      result = await this.runAutoRound(session)
     } catch (error) {
       if (!this.canRun(session)) {
         /* 轮次中账号被删除/登录失败：静默收口，不留幽灵日志（计划随 dispose 一并清理） */
-        outcome = 'done'
+        result = { outcome: 'done', closed: false, executed: [] }
       } else {
         session.log('WARN', '积分', `自动任务起跑前复查失败：${failureSuffix(error)}，10 分钟后重试（不盲发）`)
-        outcome = 'retry'
+        result = { outcome: 'retry', closed: false, executed: [] }
       }
     } finally {
       plan.inFlight = false
@@ -335,7 +344,7 @@ export class TaskRunner {
 
     if (this.plans.get(session) !== plan) return
 
-    if (outcome === 'retry') {
+    if (result.outcome === 'retry') {
       if (plan.retryDay !== dayKey()) {
         plan.retryDay = dayKey()
         plan.retries = 0
@@ -352,17 +361,34 @@ export class TaskRunner {
       return
     }
 
-    /* done：当天收口，排次日 */
-    if (outcome === 'done') plan.doneDay = dayKey()
+    /* done：当天收口，排次日，并补一条明确的收口日志（避免静默） */
+    plan.doneDay = dayKey()
     plan.retries = 0
     this.scheduleNext(plan)
+    this.logDailyClose(session, plan, result)
+  }
+
+  /** 当日收口后的排程日志：已执行任务名（或「无可执行任务」）+ 次日复查时刻与窗口 */
+  private logDailyClose(session: AccountSession, plan: Plan, result: RoundResult): void {
+    if (!result.closed || !plan.nextFireAt) return
+    const win = session.pointsWindowSnapshot
+    const shown = isUsableWindow(win) ? win : DEFAULT_POINTS_WINDOW
+    const when = dayKey(new Date(plan.nextFireAt)) === dayKey() ? '今日' : '明日'
+    const scope = `已排程 ${when} ${formatHm(plan.nextFireAt)} 复查（窗口 ${shown.winStart}–${shown.winEnd}）`
+    session.log(
+      'INFO',
+      '积分',
+      result.executed.length
+        ? `${result.executed.join('、')} 今日已完成，${scope}`
+        : `今日无可执行的自动任务（均已完成或未开启自动），${scope}`,
+    )
   }
 
   /**
    * 自动轮次：先复查（getTaskList），再逐个执行可自动执行且未完成（status=0）的任务。
    * 复查失败直接抛错（由 autoRun 顺延），不盲发执行。
    */
-  private async runAutoRound(session: AccountSession): Promise<RoundOutcome> {
+  private async runAutoRound(session: AccountSession): Promise<RoundResult> {
     /* eaichat 需人工验证（验证码/短信/设备绑定）：自动轮次不静默重登，直接放弃本轮 */
     const manual = session.eaichatManualLabel
     if (manual) {
@@ -371,7 +397,7 @@ export class TaskRunner {
         '积分',
         `本轮放弃：云智助手会话需要你本人完成${manual}验证，自动轮次不会静默重登 · 今日不再自动重试（完成验证后重新登录该账号即可恢复）`,
       )
-      return 'done'
+      return { outcome: 'done', closed: false, executed: [] }
     }
 
     const tasks = await session.refreshTasks()
@@ -390,20 +416,22 @@ export class TaskRunner {
           ? '起跑前复查：可自动执行的任务无需执行（已完成/已失效），本轮跳过'
           : '起跑前复查：没有可自动执行的任务，本轮跳过',
       )
-      return 'done'
+      return { outcome: 'done', closed: true, executed: [] }
     }
 
     let failed = false
+    const executed: string[] = []
     for (const [index, task] of candidates.entries()) {
       if (index > 0) await sleep(1_500)
-      if (!this.canRun(session)) return failed ? 'retry' : 'done'
+      if (!this.canRun(session)) return { outcome: failed ? 'retry' : 'done', closed: !failed, executed }
       /* 前一个任务执行期间任务表可能已刷新：以最新状态为准 */
       const latest = session.findTask(task.taskDefId) ?? task
       if (latest.status !== 0) continue
       const result = await this.executeOne(session, latest, 'auto')
       if (result === 'failed') failed = true
+      else if (result === 'ok') executed.push(latest.taskDefName)
     }
-    return failed ? 'retry' : 'done'
+    return { outcome: failed ? 'retry' : 'done', closed: !failed, executed }
   }
 
   /**

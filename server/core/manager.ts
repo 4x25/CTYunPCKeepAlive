@@ -14,9 +14,11 @@ import {
   MAX_ACCOUNTS,
   MAX_INTERVAL_MINUTES,
   MIN_INTERVAL_MINUTES,
+  TOKEN_DAILY_TASK_ID,
 } from '../../shared/constants'
 import type {
   AddAccountResult,
+  CheckinTokenTaskResult,
   CredentialsBody,
   DeleteAccountResult,
   DesktopsResult,
@@ -30,6 +32,7 @@ import type {
   SetDesktopAutoResult,
   SetTaskAutoResult,
   StateSnapshot,
+  TokenResult,
   UpdateCredentialsResult,
 } from '../../shared/types'
 import { isHm, maskOf, nowHm } from '../../shared/utils'
@@ -38,9 +41,10 @@ import { ApiError } from '../envelope'
 import type { PersistedAccount, PersistedConfig } from '../store/config'
 import { CONFIG_DIR, loadConfig, saveConfig } from '../store/config'
 import { appendLog, clearAccountLogs, getSystemLogs, initLogStore, LOG_RETENTION_DAYS } from '../store/logs'
-import { UpstreamError, upstreamMessage } from '../upstream/errors'
+import { UpstreamError, UpstreamNetworkError, upstreamMessage } from '../upstream/errors'
 import { AccountSession, LOGIN_BUDGET_MS, RevisionCounter } from './session'
 import { isExecutableTask } from './points'
+import { toTokenResult } from './token'
 import { scheduler } from './scheduler'
 import { taskRunner } from './task-runner'
 import type { KeepaliveOutcome } from './keepalive'
@@ -775,7 +779,7 @@ export class AccountManager {
       throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法获取积分与任务')
     }
     try {
-      const snapshot = await session.refreshPoints()
+      const snapshot = await session.refreshPoints({ log: false })
       return { points: snapshot.points, tasks: snapshot.tasks, updatedDate: snapshot.updatedDate }
     } catch (error) {
       throw this.toApiError(error)
@@ -849,6 +853,96 @@ export class AccountManager {
     return { revision: this.revision.value, taskDefId, auto }
   }
 
+  /* ── 4.15 刷新云智助手 Token 用量与任务 ─────────────────── */
+
+  async listToken(userId: number): Promise<TokenResult> {
+    await this.ready()
+    const session = this.requireSession(userId)
+    if (session.hasBanner) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法获取云智助手 Token')
+    }
+    if (!session.isEaichatReady) {
+      throw new ApiError(ErrorCode.EaichatUnavailable, this.tokenUnavailableMessage(session))
+    }
+    try {
+      return toTokenResult(await session.refreshToken())
+    } catch (error) {
+      throw this.toTokenApiError(session, error, 'refresh')
+    }
+  }
+
+  /* ── 4.16 签到 / 领取 Token 任务 ─────────────────────────── */
+
+  async checkinTokenTask(userId: number, taskDefId: number): Promise<CheckinTokenTaskResult> {
+    await this.ready()
+    const session = this.requireSession(userId)
+    if (session.hasBanner) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法操作云智助手 Token 任务')
+    }
+    if (!session.isEaichatReady) {
+      throw new ApiError(ErrorCode.EaichatUnavailable, this.tokenUnavailableMessage(session))
+    }
+
+    const task = session.findTokenTask(taskDefId)
+    if (!task) throw new ApiError(ErrorCode.TaskNotFound, '任务不存在，请刷新后重试')
+    if (task.status === 3) throw new ApiError(ErrorCode.StateNotAllowed, '该任务已失效，无需操作')
+    if (task.status === 2) throw new ApiError(ErrorCode.StateNotAllowed, '该任务已完成，无需重复操作')
+    if (task.status === 1) throw new ApiError(ErrorCode.StateNotAllowed, '奖励正在发放中，无需重复操作')
+    if (session.isTokenTaskRunning(taskDefId)) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '该任务正在操作中，请稍候')
+    }
+    if (!task.canReceive) {
+      throw new ApiError(
+        ErrorCode.StateNotAllowed,
+        taskDefId === TOKEN_DAILY_TASK_ID ? '今日已签到，明日 00:00 后重置' : '任务未达标，暂不可领取',
+      )
+    }
+
+    let snapshot
+    try {
+      snapshot = await session.checkinTokenTask(taskDefId)
+    } catch (error) {
+      throw this.toTokenApiError(session, error, 'checkin')
+    }
+    const result = toTokenResult(snapshot)
+    return {
+      revision: this.revision.value,
+      taskDefId,
+      ok: true,
+      token: result.token,
+      tasks: result.tasks,
+      updatedDate: result.updatedDate,
+    }
+  }
+
+  private tokenUnavailableMessage(_session: AccountSession): string {
+    return '云智助手会话不可用，Token 任务暂不可用'
+  }
+
+  /**
+   * Token 接口的错误映射：
+   * - 401/40010 → 10008，并把会话标记为不可用（后续请求不再盲试）；
+   * - 网络类 → 10006；
+   * - 签到的业务拒绝 → 10005；刷新时的其它上游错误 → 透传/10006。
+   */
+  private toTokenApiError(session: AccountSession, error: unknown, mode: 'refresh' | 'checkin'): ApiError {
+    if (error instanceof ApiError) return error
+    if (error instanceof UpstreamError && error.code === 40010) {
+      if (session.isEaichatReady) session.markEaichatFailure(error)
+      this.logAccount(session, 'WARN', '账号', `${maskOf(session.accountName)} 云智助手会话已过期，Token 任务暂不可用`)
+      return new ApiError(ErrorCode.EaichatUnavailable, this.tokenUnavailableMessage(session))
+    }
+    if (error instanceof UpstreamNetworkError) {
+      return new ApiError(ErrorCode.UpstreamNetwork, '上游网络异常或超时，请稍后重试')
+    }
+    if (error instanceof UpstreamError) {
+      if (mode === 'checkin') return new ApiError(ErrorCode.StateNotAllowed, error.message || '签到失败，请刷新后重试')
+      if (error.code === -1) return new ApiError(ErrorCode.UpstreamNetwork, 'Token 数据获取失败，请稍后重试')
+      return new ApiError(error.code, sessionApiMessage(error.code))
+    }
+    return new ApiError(ErrorCode.UpstreamNetwork, '上游请求失败，请稍后重试')
+  }
+
   /* ── 4.14 清空界面日志 ──────────────────────────────────── */
 
   /**
@@ -909,7 +1003,11 @@ export class AccountManager {
         this.refreshedAt = nowHm()
       },
       /* 列表刷新后对齐计划（run 变化即时反作用于计划、恢复计时） */
-      desktopsUpdated: () => scheduler.syncSession(session),
+      desktopsUpdated: () => {
+        /* 列表刷新成功 = 30060（设备未绑定）兜底暂停可解除 */
+        scheduler.noteDesktopsRefreshed(session)
+        scheduler.syncSession(session)
+      },
       /* 删除/替换/登录失败：清掉该会话全部定时器与追踪任务 */
       disposed: () => {
         scheduler.dropSession(session)

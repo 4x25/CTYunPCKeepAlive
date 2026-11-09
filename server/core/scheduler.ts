@@ -10,9 +10,11 @@
  *   - run 变化：running→stopped/starting/stopping 立即取消计划；回到 running 重新计时
  *
  * 探测：每轮执行前 `pageDesktop` 刷新该账号实例状态；失败不阻断本轮（降级用旧状态 + 节流 WARN）。
+ *       成功写 INFO（静默刷新），失败按「同账号 + 同原因」1 小时节流；兜底探测命中 30060（设备未绑定）
+ *       时暂停该账号的兜底拉取（保活前探测不受影响），列表刷新成功后自动解除。
  * 无任何 auto=true 实例的账号降为 30 分钟兜底拉取。
  * 过渡态：发现 starting/stopping 时为该账号开 10s 追踪任务，5 分钟（30 次）未收敛则放弃；
- * 追踪与保活探测共用 session.refreshDesktops 的单飞请求，不重复打上游。
+ * 追踪与保活探测共用 session.refreshDesktops 的单飞请求，不重复打上游（不逐次写日志）。
  */
 import { ErrorCode } from '../../shared/constants'
 import type { RunState } from '../../shared/types'
@@ -35,8 +37,12 @@ const PROBE_TIMEOUT_MS = 8_000
 const MANUAL_ROUND_BUDGET_MS = 12_000
 /** 等待已开跑的定时轮次收尾的上限：超出即回 10005，绝不让请求悬挂到前端超时 */
 const MANUAL_WAIT_BUDGET_MS = 5_000
-/** 探测失败 WARN 节流：同账号 10 分钟内只记一次，避免上游故障时刷屏 */
+/** 探测（跳过）WARN 节流：同账号同类 10 分钟内只记一次，避免上游故障时刷屏 */
 const PROBE_WARN_GAP_MS = WARN_THROTTLE_MS
+/** 探测失败 WARN 进 ring 的节流：同账号 + 同原因（code/kind）1 小时一条，避免每轮刷屏 */
+const PROBE_WARN_RING_GAP_MS = 60 * 60_000
+/** 设备未绑定（4xx 业务码）：兜底探测无意义，命中后暂停该账号的 30 分钟兜底拉取 */
+const DEVICE_UNBOUND_CODE = 30060
 
 interface Plan {
   key: string
@@ -58,7 +64,20 @@ interface Plan {
 
 interface Tracker {
   timer: ReturnType<typeof setTimeout> | null
+  /** 已发起的拉取次数（每 tick 一次） */
   ticks: number
+  /** 被跟踪的过渡态实例名（收敛/放弃日志用） */
+  names: string[]
+  /** 开始跟踪的时刻（收敛日志耗时用） */
+  startedAt: number
+}
+
+/** 一次探测失败的归类（用于 WARN 文案与节流键） */
+interface ProbeFailure {
+  detail: string
+  /** 节流键：`code=xxx` / network / timeout / unknown */
+  reason: string
+  code: number | null
 }
 
 const planKey = (userId: number, desktopId: string) => `${userId}:${desktopId}`
@@ -85,6 +104,10 @@ export class KeepaliveScheduler {
   private readonly trackers = new Map<AccountSession, Tracker>()
   private readonly fallbacks = new Map<AccountSession, ReturnType<typeof setInterval>>()
   private readonly warnAt = new Map<AccountSession, Partial<Record<'scheduler' | 'keepalive', number>>>()
+  /** 探测失败 WARN 的按原因节流水位：session → reason → 上次记录时间 */
+  private readonly probeWarnAt = new Map<AccountSession, Map<string, number>>()
+  /** 30060（设备未绑定）导致暂停兜底探测的账号；列表刷新成功后解除 */
+  private readonly fallbackPaused = new Set<AccountSession>()
   /** 上一次同步时各实例的 run：用于「暂停/恢复计时」日志 */
   private readonly lastRun = new Map<AccountSession, Map<string, RunState>>()
   private closed = false
@@ -115,6 +138,8 @@ export class KeepaliveScheduler {
     for (const timer of this.fallbacks.values()) clearInterval(timer)
     this.fallbacks.clear()
     this.warnAt.clear()
+    this.probeWarnAt.clear()
+    this.fallbackPaused.clear()
     this.lastRun.clear()
   }
 
@@ -132,7 +157,19 @@ export class KeepaliveScheduler {
     if (fallback) clearInterval(fallback)
     this.fallbacks.delete(session)
     this.warnAt.delete(session)
+    this.probeWarnAt.delete(session)
+    this.fallbackPaused.delete(session)
     this.lastRun.delete(session)
+  }
+
+  /**
+   * 云电脑列表成功刷新（4.7 / 登录恢复 / 保活前探测 / 过渡态追踪）后由 session 通知：
+   * 清除 30060 兜底暂停标记；若确实从暂停中恢复，补一条 INFO（避免静默）。
+   * 调用方随后会 `syncSession`（内含 `syncFallback`）按最新状态重排兜底定时器。
+   */
+  noteDesktopsRefreshed(session: AccountSession): void {
+    if (!this.fallbackPaused.delete(session)) return
+    session.log('INFO', '调度', `${maskOf(session.accountName)} 云电脑列表刷新成功，兜底探测暂停已解除`)
   }
 
   /* ── 计划派生（/state 实时计算，不缓存） ─────────────────── */
@@ -527,27 +564,22 @@ export class KeepaliveScheduler {
 
   /* ── 探测 / 过渡态 / 兜底 ───────────────────────────────── */
 
-  /** 保活前探测：失败/超时不阻断；成功刷新会触发 syncSession（`run` 变化即时反作用于计划） */
-  private async probe(session: AccountSession, timeoutMs = PROBE_TIMEOUT_MS): Promise<boolean> {
-    /* 失败 WARN 按账号 10 分钟节流：多实例账号每轮都探测，不能每台都刷一条 */
-    const warn = (detail: string) => {
-      this.logWarnThrottled(
-        session,
-        `${maskOf(session.accountName)} 保活前探测失败：${detail}，本轮降级使用上次状态`,
-        'scheduler',
-      )
-    }
-
+  /**
+   * 探测：保活前探测与 30 分钟兜底探测共用。
+   *   - 成功：写 INFO「静默刷新云电脑列表 · N 台 · 耗时 Xms」（可观测「静默刷新确实在工作」）
+   *   - 失败：不阻断本轮（降级用旧状态）；同账号 + 同原因 WARN 进 ring 按 1 小时节流
+   *   - `source='fallback'` 且错误为 30060（设备未绑定）时暂停兜底探测并只记一次
+   */
+  private async probe(
+    session: AccountSession,
+    timeoutMs = PROBE_TIMEOUT_MS,
+    source: 'keepalive' | 'fallback' = 'keepalive',
+  ): Promise<boolean> {
+    const startedAt = Date.now()
     const attempt = session.refreshDesktops({ timeoutMs, retries: 0 }).then(
       () => 'ok' as const,
       (error: unknown) => {
-        const detail =
-          error instanceof UpstreamNetworkError
-            ? '上游网络异常或超时'
-            : error instanceof UpstreamError
-              ? `上游返回错误（code=${error.code}）`
-              : '未知错误'
-        warn(detail)
+        this.reportProbeFailure(session, this.classifyProbeFailure(error), source)
         return 'failed' as const
       },
     )
@@ -560,13 +592,73 @@ export class KeepaliveScheduler {
     try {
       const result = await Promise.race([attempt, guard])
       if (result === 'timeout') {
-        warn('探测超时')
+        this.reportProbeFailure(session, { detail: '探测超时', reason: 'timeout', code: null }, source)
         return false
       }
-      return result === 'ok'
+      if (result === 'ok') {
+        session.log(
+          'INFO',
+          '调度',
+          `${maskOf(session.accountName)} 静默刷新云电脑列表 · ${session.desktopList.length} 台 · 耗时 ${Math.max(
+            0,
+            Date.now() - startedAt,
+          )}ms`,
+        )
+        return true
+      }
+      return false
     } finally {
       if (timer) clearTimeout(timer)
     }
+  }
+
+  /** 上游错误 → 固定归类（不写上游原文以外的 ID / 账号） */
+  private classifyProbeFailure(error: unknown): ProbeFailure {
+    if (error instanceof UpstreamNetworkError) {
+      return { detail: '上游网络异常或超时', reason: 'network', code: null }
+    }
+    if (error instanceof UpstreamError) {
+      return { detail: `上游返回错误（code=${error.code}）`, reason: `code=${error.code}`, code: error.code }
+    }
+    return { detail: '未知错误', reason: 'unknown', code: null }
+  }
+
+  /**
+   * 探测失败：
+   *   - 兜底探测命中 30060（设备未绑定）→ 暂停兜底（只记一次），保活前探测不受影响
+   *   - 其余错误 → 同账号 + 同原因 1 小时内只记一次 WARN（不暂停）
+   */
+  private reportProbeFailure(session: AccountSession, failure: ProbeFailure, source: 'keepalive' | 'fallback'): void {
+    if (source === 'fallback' && failure.code === DEVICE_UNBOUND_CODE) {
+      this.pauseFallbackProbe(session)
+      return
+    }
+    const record = this.probeWarnAt.get(session) ?? new Map<string, number>()
+    const last = record.get(failure.reason) ?? 0
+    if (Date.now() - last < PROBE_WARN_RING_GAP_MS) return
+    record.set(failure.reason, Date.now())
+    this.probeWarnAt.set(session, record)
+    session.log(
+      'WARN',
+      '调度',
+      `${maskOf(session.accountName)} 保活前探测失败：${failure.detail}，本轮降级使用上次状态`,
+    )
+  }
+
+  /** 暂停某账号的 30 分钟兜底探测（30060 设备未绑定），并写唯一一条说明日志 */
+  private pauseFallbackProbe(session: AccountSession): void {
+    if (this.fallbackPaused.has(session)) return
+    this.fallbackPaused.add(session)
+    const existing = this.fallbacks.get(session)
+    if (existing) {
+      clearInterval(existing)
+      this.fallbacks.delete(session)
+    }
+    session.log(
+      'WARN',
+      '调度',
+      `已暂停 ${maskOf(session.accountName)} 的兜底探测：该账号需要先在官方客户端完成设备绑定；手动刷新列表或重新登录后恢复`,
+    )
   }
 
   /** 同类 WARN 10 分钟内只记一次（探测/跳过可能高频触发） */
@@ -584,24 +676,46 @@ export class KeepaliveScheduler {
     const transitional = session.desktopList.filter((desktop) => isTransitional(desktop.run))
     const existing = this.trackers.get(session)
     if (!transitional.length) {
-      if (existing) {
-        if (existing.timer) clearTimeout(existing.timer)
-        this.trackers.delete(session)
-        session.log('INFO', '调度', '实例状态已稳定，过渡态跟踪结束')
-      }
+      if (existing) this.stopTracker(session, existing, 'converged')
       return
     }
     if (existing) return
 
-    const names = transitional.map((desktop) => desktop.desktopName).join('、')
-    session.log(
-      'INFO',
-      '调度',
-      `${names} 处于${[...new Set(transitional.map((desktop) => RUN_LABEL[desktop.run]))].join('/')}，已开始每 10 秒跟踪实例状态`,
-    )
-    const tracker: Tracker = { timer: null, ticks: 0 }
+    const names = transitional.map((desktop) => desktop.desktopName)
+    session.log('INFO', '调度', `发现过渡态 ${names.join('、')}，开始 10s 跟踪`)
+    const tracker: Tracker = { timer: null, ticks: 0, names, startedAt: Date.now() }
     this.trackers.set(session, tracker)
     this.trackTracker(session, tracker)
+  }
+
+  /**
+   * 停止过渡态跟踪并收口：
+   *   - converged：已回到稳态（INFO，含共拉取次数与耗时）
+   *   - gaveUp：5 分钟未收敛（WARN，保留原口径）
+   *   - silent：会话不可用/已销毁（不刷日志）
+   */
+  private stopTracker(session: AccountSession, tracker: Tracker, reason: 'converged' | 'gaveUp' | 'silent'): void {
+    if (tracker.timer) {
+      clearTimeout(tracker.timer)
+      tracker.timer = null
+    }
+    this.trackers.delete(session)
+    if (reason === 'converged') {
+      const seconds = Math.max(1, Math.round((Date.now() - tracker.startedAt) / 1000))
+      session.log(
+        'INFO',
+        '调度',
+        `${tracker.names.join('、')} 已回到稳态，停止跟踪（共拉取 ${tracker.ticks} 次，耗时 ${seconds}s）`,
+      )
+      return
+    }
+    if (reason === 'gaveUp') {
+      session.log(
+        'WARN',
+        '调度',
+        `${tracker.names.join('、')} 连续 5 分钟未进入稳态，已停止跟踪，回落常规保活节奏`,
+      )
+    }
   }
 
   private trackTracker(session: AccountSession, tracker: Tracker): void {
@@ -617,13 +731,14 @@ export class KeepaliveScheduler {
   private async trackerTick(session: AccountSession, tracker: Tracker): Promise<void> {
     if (this.closed || this.trackers.get(session) !== tracker) return
     if (!session.isLoggedIn || session.hasBanner) {
-      this.trackers.delete(session)
+      this.stopTracker(session, tracker, 'silent')
       return
     }
 
     tracker.ticks += 1
     try {
-      /* 与保活前探测共用 session.refreshDesktops 的单飞请求：同时到达时不重复打上游 */
+      /* 与保活前探测共用 session.refreshDesktops 的单飞请求：同时到达时不重复打上游。
+         拉取成功会触发 desktopsUpdated → syncSession → 这里可能已被 maybeStartTracker 收敛收口。 */
       await session.refreshDesktops({ timeoutMs: PROBE_TIMEOUT_MS, retries: 0 })
     } catch {
       /* 追踪失败不刷屏：下一 tick 再试，到上限统一放弃 */
@@ -632,25 +747,20 @@ export class KeepaliveScheduler {
     if (this.trackers.get(session) !== tracker) return
     const stillTransitional = session.desktopList.filter((desktop) => isTransitional(desktop.run))
     if (!stillTransitional.length) {
-      this.trackers.delete(session)
-      session.log('INFO', '调度', '实例状态已稳定，过渡态跟踪结束')
+      this.stopTracker(session, tracker, 'converged')
       return
     }
     if (tracker.ticks >= TRANSITION_MAX_TICKS) {
-      this.trackers.delete(session)
-      session.log(
-        'WARN',
-        '调度',
-        `${stillTransitional.map((desktop) => desktop.desktopName).join('、')} 连续 5 分钟未进入稳态，已停止跟踪，回落常规保活节奏`,
-      )
+      this.stopTracker(session, tracker, 'gaveUp')
       return
     }
     this.trackTracker(session, tracker)
   }
 
-  /** 无 auto 实例的账号：30 分钟兜底拉取，保证 run/列表变化不会长期失真 */
+  /** 无 auto 实例的账号：30 分钟兜底拉取，保证 run/列表变化不会长期失真（30060 暂停期间不重排） */
   private syncFallback(session: AccountSession): void {
-    const needFallback = session.isLoggedIn && !session.hasBanner && !session.hasAutoDesktop
+    const needFallback =
+      session.isLoggedIn && !session.hasBanner && !session.hasAutoDesktop && !this.fallbackPaused.has(session)
     const existing = this.fallbacks.get(session)
     if (!needFallback) {
       if (existing) clearInterval(existing)
@@ -660,7 +770,7 @@ export class KeepaliveScheduler {
     if (existing) return
     const timer = setInterval(() => {
       if (this.closed || !session.isLoggedIn || session.hasBanner || session.hasAutoDesktop) return
-      void this.probe(session)
+      void this.probe(session, PROBE_TIMEOUT_MS, 'fallback')
     }, FALLBACK_REFRESH_MS)
     timer.unref?.()
     this.fallbacks.set(session, timer)
