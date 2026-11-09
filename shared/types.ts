@@ -118,6 +118,8 @@ export interface TokenTask {
   isSatisfiedCondition: boolean
   /** 连续签到进度：key 为 "1".."7"，1 = 当天已签到 */
   receiveProgressMap: Record<string, number>
+  /** 自动签到开关（仅每日签到支持；本工具持久化） */
+  auto: boolean
   /** 签到 / 领取操作在途 */
   busy: boolean
 }
@@ -327,6 +329,13 @@ export interface TokenResult {
   token: TokenSummary
   tasks: TokenTask[]
   updatedDate: number
+}
+
+/** 4.17 PATCH /api/accounts/:userId/token/tasks/:taskDefId */
+export interface SetTokenTaskAutoResult {
+  revision: number
+  taskDefId: number
+  auto: boolean
 }
 
 /** 4.16 POST /api/accounts/:userId/token/tasks/:taskDefId/checkin */

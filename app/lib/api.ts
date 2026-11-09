@@ -17,6 +17,7 @@ import type {
   RunTaskResult,
   SetDesktopAutoResult,
   SetTaskAutoResult,
+  SetTokenTaskAutoResult,
   StateSnapshot,
   TokenResult,
   UpdateCredentialsResult,
@@ -26,7 +27,7 @@ import { mockApi } from './api-mock'
 
 export { ApiError, isApiError, isTimeout } from './api-error'
 
-/** 与 api.md §3 的 16 个接口一一对应；api-mock.ts 实现同一份签名 */
+/** 与 api.md §3 的 17 个接口一一对应；api-mock.ts 实现同一份签名 */
 export interface ApiClient {
   /** 4.1 全量快照 */
   getState(): Promise<StateSnapshot>
@@ -56,6 +57,8 @@ export interface ApiClient {
   getToken(userId: number): Promise<TokenResult>
   /** 4.16 签到 / 领取 Token 任务 */
   checkinTokenTask(userId: number, taskDefId: number): Promise<CheckinTokenTaskResult>
+  /** 4.17 切换 Token 任务自动开关 */
+  setTokenTaskAuto(userId: number, taskDefId: number, auto: boolean): Promise<SetTokenTaskAutoResult>
   /** 4.13 日志查询 */
   queryLogs(query: LogQuery): Promise<LogsResult>
   /** 4.14 清空界面日志 */
@@ -220,6 +223,12 @@ const realApi: ApiClient = {
   checkinTokenTask: (userId, taskDefId) =>
     request<CheckinTokenTaskResult>('POST', `/accounts/${uid(userId)}/token/tasks/${tid(taskDefId)}/checkin`, {
       timeoutMs: TIMEOUT_MS.list,
+    }),
+
+  setTokenTaskAuto: (userId, taskDefId, auto) =>
+    request<SetTokenTaskAutoResult>('PATCH', `/accounts/${uid(userId)}/token/tasks/${tid(taskDefId)}`, {
+      body: { auto },
+      timeoutMs: TIMEOUT_MS.light,
     }),
 
   queryLogs: (query) =>

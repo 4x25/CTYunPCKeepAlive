@@ -31,6 +31,7 @@ import type {
   RunState,
   SetDesktopAutoResult,
   SetTaskAutoResult,
+  SetTokenTaskAutoResult,
   StateSnapshot,
   TokenResult,
   UpdateCredentialsResult,
@@ -47,6 +48,7 @@ import { isExecutableTask } from './points'
 import { toTokenResult } from './token'
 import { scheduler } from './scheduler'
 import { taskRunner } from './task-runner'
+import { tokenAutoRunner } from './token-runner'
 import type { KeepaliveOutcome } from './keepalive'
 
 function sessionApiMessage(code: number): string {
@@ -189,6 +191,7 @@ export class AccountManager {
         this.dedupeSessions(session, label)
         scheduler.syncSession(session)
         taskRunner.syncSession(session)
+        tokenAutoRunner.syncSession(session)
         const pcCount = session.toAccount().pcs.length
         this.logAccount(
           session,
@@ -303,6 +306,7 @@ export class AccountManager {
       pointsWindow: { ...DEFAULT_POINTS_WINDOW },
       desktops: [],
       tasks: [],
+      tokenTasks: [],
     })
 
     let warnings: string[]
@@ -340,6 +344,7 @@ export class AccountManager {
     /* 新账号的自动开关全部默认关闭；确保没有同 userId 的残留计划 */
     scheduler.syncSession(session)
     taskRunner.syncSession(session)
+    tokenAutoRunner.syncSession(session)
     if (replaced) {
       this.logSystem(
         'INFO',
@@ -400,6 +405,7 @@ export class AccountManager {
       pointsWindow: { ...DEFAULT_POINTS_WINDOW },
       desktops: [],
       tasks: [],
+      tokenTasks: [],
     })
 
     let warnings: string[]
@@ -422,6 +428,7 @@ export class AccountManager {
     /* 继承的 auto 开关要立刻生效（登录时的列表拉取发生在继承之前） */
     scheduler.syncSession(draft)
     taskRunner.syncSession(draft)
+    tokenAutoRunner.syncSession(draft)
 
     const displaced = this.sessions.filter((item) => item !== previous && item.userId === draft.userId)
     const sameUserId = draft.userId === previous.userId
@@ -436,6 +443,7 @@ export class AccountManager {
       draft.dispose()
       scheduler.syncSession(previous)
       taskRunner.syncSession(previous)
+      tokenAutoRunner.syncSession(previous)
       throw error
     }
 
@@ -501,6 +509,7 @@ export class AccountManager {
       /* banner 期间被取消的计划在重新登录成功后恢复（列表拉取早于 finalize） */
       scheduler.syncSession(session)
       taskRunner.syncSession(session)
+      tokenAutoRunner.syncSession(session)
       const suffix = warnings.length
         ? warnings.every((warning) => warning.includes('云智助手'))
           ? ' · 云智助手会话不可用，无感保活暂不可用'
@@ -915,6 +924,40 @@ export class AccountManager {
     }
   }
 
+  /* ── 4.17 切换 Token 任务自动开关（仅每日签到） ─────────── */
+
+  async setTokenTaskAuto(userId: number, taskDefId: number, auto: boolean): Promise<SetTokenTaskAutoResult> {
+    await this.ready()
+    const session = this.requireSession(userId)
+    if (taskDefId !== TOKEN_DAILY_TASK_ID) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '该 Token 任务暂不支持自动操作')
+    }
+    if (auto && session.hasBanner) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法修改 Token 自动签到')
+    }
+
+    const wasAuto = session.isTokenTaskAuto(taskDefId)
+    session.setTokenTaskAuto(taskDefId, auto)
+    try {
+      await this.persistSessions(this.sessions)
+    } catch (error) {
+      session.setTokenTaskAuto(taskDefId, wasAuto)
+      throw error
+    }
+
+    tokenAutoRunner.syncSession(session)
+    if (wasAuto !== auto) {
+      this.logAccount(
+        session,
+        'INFO',
+        '积分',
+        `${session.findTokenTask(taskDefId)?.taskDefName ?? '每日签到'} 已${auto ? '开启' : '关闭'}自动签到` +
+          (auto ? '（每天 00:10 后检查并补签）' : '（不再自动签到）'),
+      )
+    }
+    return { revision: this.revision.value, taskDefId, auto }
+  }
+
   private tokenUnavailableMessage(_session: AccountSession): string {
     return '云智助手会话不可用，Token 任务暂不可用'
   }
@@ -1012,6 +1055,7 @@ export class AccountManager {
       disposed: () => {
         scheduler.dropSession(session)
         taskRunner.dropSession(session)
+        tokenAutoRunner.dropSession(session)
       },
       /* left 实时派生：nextFireAt - now() */
       planLeft: (desktopId: string) => scheduler.leftFor(session.userId, desktopId),

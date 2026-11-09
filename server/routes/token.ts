@@ -18,6 +18,10 @@ const taskParamsSchema = z.object({
   taskDefId: z.coerce.number().int().positive('任务标识不合法'),
 })
 
+const setAutoSchema = z.object({
+  auto: z.boolean('auto 必须是布尔值'),
+})
+
 function parseParams<S extends z.ZodType>(c: Context, schema: S): z.infer<S> {
   const parsed = schema.safeParse(c.req.param())
   if (!parsed.success) {
@@ -26,6 +30,23 @@ function parseParams<S extends z.ZodType>(c: Context, schema: S): z.infer<S> {
       ErrorCode.InvalidParam,
       `参数校验失败：${message && /[\u4e00-\u9fa5]/.test(message) ? message : '路径参数不合法'}`,
     )
+  }
+  return parsed.data
+}
+
+async function parseJson<S extends z.ZodType>(c: Context, schema: S): Promise<z.infer<S>> {
+  let raw: unknown
+  try {
+    raw = await c.req.json()
+  } catch {
+    throw new ApiError(ErrorCode.InvalidParam, '参数校验失败：请求体必须是合法 JSON')
+  }
+  const parsed = schema.safeParse(raw)
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0]
+    const rawMessage = issue?.message ?? ''
+    const message = /[\u4e00-\u9fa5]/.test(rawMessage) ? rawMessage : '请求体不正确'
+    throw new ApiError(ErrorCode.InvalidParam, `参数校验失败：${message}`)
   }
   return parsed.data
 }
@@ -42,4 +63,11 @@ tokenRoute.get('/:userId/token', async (c) => {
 tokenRoute.post('/:userId/token/tasks/:taskDefId/checkin', async (c) => {
   const { userId, taskDefId } = parseParams(c, taskParamsSchema)
   return c.json(ok(await manager.checkinTokenTask(userId, taskDefId)))
+})
+
+/* 4.17 切换 Token 任务自动开关（仅每日签到） */
+tokenRoute.patch('/:userId/token/tasks/:taskDefId', async (c) => {
+  const { userId, taskDefId } = parseParams(c, taskParamsSchema)
+  const { auto } = await parseJson(c, setAutoSchema)
+  return c.json(ok(await manager.setTokenTaskAuto(userId, taskDefId, auto)))
 })

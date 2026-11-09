@@ -43,6 +43,7 @@ import type {
   RunTaskResult,
   SetDesktopAutoResult,
   SetTaskAutoResult,
+  SetTokenTaskAutoResult,
   StateSnapshot,
   TokenResult,
   TokenSummary,
@@ -208,6 +209,7 @@ function tokenTask(
     canReceive,
     isSatisfiedCondition: true,
     receiveProgressMap: { '1': 0, '2': 0, '3': 0, '4': 0, '5': 0, '6': 0, '7': 0 },
+    auto: false,
     busy: false,
   }
 }
@@ -1156,6 +1158,23 @@ export const mockApi: ApiClient = {
     )
     const result = cloneTokenResult(account)
     return { revision: state.revision, taskDefId, ok: true, ...result } satisfies CheckinTokenTaskResult
+  },
+
+  async setTokenTaskAuto(userId, taskDefId, auto) {
+    const account = findAccount(userId)
+    if (taskDefId !== TOKEN_DAILY_TASK_ID) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '该 Token 任务暂不支持自动操作')
+    }
+    if (auto && account.banner) {
+      throw new ApiError(ErrorCode.StateNotAllowed, '账号处于异常状态，暂时无法修改 Token 自动签到')
+    }
+    const task = account.tokenTasks.find((item) => item.taskDefId === taskDefId)
+    if (!task) throw new ApiError(ErrorCode.TaskNotFound, '任务不存在，请刷新后重试')
+    await sleep(latency(80, 80))
+    task.auto = auto
+    state.revision += 1
+    appendLog(userId, 'INFO', '积分', `${task.taskDefName} 已${auto ? '开启' : '关闭'}自动签到`)
+    return { revision: state.revision, taskDefId, auto } satisfies SetTokenTaskAutoResult
   },
 
   async queryLogs(query: LogQuery) {

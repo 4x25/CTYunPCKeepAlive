@@ -32,7 +32,7 @@ app/
     EmptyAccountPanel.tsx 零账号空态（不展示功能页签，整幅提示 + 添加账号按钮）
     KeepAlivePanel.tsx   保活面板：设置行 + 云电脑表格 + 空态
     PointsPanel.tsx      积分任务面板：时间窗口 + 积分概览 + 任务表格
-    TokenPanel.tsx       云智助手 Token 面板：可用 Token + 已消耗/共进度条 + 签到任务表
+    TokenPanel.tsx       云智助手 Token 面板：可用 Token + 已消耗/共进度条 + 签到任务表（每日签到支持自动）
     LogPanel.tsx         日志面板：筛选工具栏 + 日志表 + 归属脚注
     ModalLayer.tsx       模态容器（常驻原生 dialog，open 态驱动 showModal/close；method="dialog" 表单：角落关闭按钮/遮罩关闭；Escape 由 onKeyDown 拦截，cancel 事件仅做锁定兜底；焦点圈定/归还走原生）
     AddAccountForm.tsx   添加账号 / 修正凭据表单（只做必填校验）
@@ -54,7 +54,8 @@ server/                  /api 后端（同进程挂载；按业务纵切补齐�
   core/                  manager.ts（账号生命周期/启动恢复）、session.ts（双平台登录态与快照）
                          scheduler.ts（每实例定时器/探测/过渡态追踪）、keepalive.ts（保活执行）
                          points.ts（积分聚合/可执行任务集）、token.ts（Token 任务映射）、
-                         task-runner.ts（积分任务编排）、warn-throttle.ts
+                         task-runner.ts（积分任务编排）、token-runner.ts（Token 每日自动签到）、
+                         warn-throttle.ts
   upstream/              ctyun-client.ts / eaichat-client.ts / crypto.ts / errors.ts
   store/                 config.ts（~/.ctyun-pc-keep-alive/config.json 原子写，可用 CTYUN_PC_KEEPALIVE_HOME 覆盖）、logs.ts（内存 ring + 磁盘）
 ```

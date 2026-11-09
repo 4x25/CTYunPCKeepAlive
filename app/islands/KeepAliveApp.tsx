@@ -75,6 +75,8 @@ const accountHold = (userId: number) => `account:${userId}`
 const taskAutoHold = (userId: number, taskDefId: number) => `task-auto:${taskKey(userId, taskDefId)}`
 const taskRunHold = (userId: number, taskDefId: number) => `task-run:${taskKey(userId, taskDefId)}`
 const tokenTaskKey = (userId: number, taskDefId: number) => `token:${taskKey(userId, taskDefId)}`
+const tokenAutoHold = (userId: number, taskDefId: number) => `token-auto:${taskKey(userId, taskDefId)}`
+const tokenRunHold = (userId: number, taskDefId: number) => `token-run:${taskKey(userId, taskDefId)}`
 
 interface PendingFetch {
   minRevision?: number
@@ -111,6 +113,7 @@ export default function KeepAliveApp() {
   /* 云智助手 Token：刷新在途 / 签到在途（键为 `userId:taskDefId`） */
   const [refreshingToken, setRefreshingToken] = useState<Record<number, boolean>>({})
   const [busyTokenTask, setBusyTokenTask] = useState<Record<string, boolean>>({})
+  const [busyTokenAuto, setBusyTokenAuto] = useState<Record<string, boolean>>({})
   const [justOkPc, setJustOkPc] = useState<Record<string, boolean>>({})
   /* busyDesktop / busyTask 是同一资源的唯一在途标记：手动保活与自动开关共用前者，任务执行与任务开关共用后者 */
   const [busyDesktop, setBusyDesktop] = useState<Record<string, boolean>>({})
@@ -146,6 +149,7 @@ export default function KeepAliveApp() {
   const pointsRefreshingRef = useRef<Set<number>>(new Set())
   const tokenRefreshingRef = useRef<Set<number>>(new Set())
   const busyTokenTaskRef = useRef<Set<string>>(new Set())
+  const busyTokenAutoRef = useRef<Set<string>>(new Set())
   const clearArmedAtRef = useRef<Record<number, number>>({})
   const toastIdRef = useRef(0)
   const zeroSinceRef = useRef<number | null>(null)
@@ -416,6 +420,30 @@ export default function KeepAliveApp() {
           }
           if (inFlightRef.current.has(taskRunHold(account.userId, task.taskDefId))) {
             merged = { ...merged, status: old.status, busy: old.busy }
+          }
+          return merged
+        }),
+      }
+    }
+
+    if (
+      next.tokenTasks.some(
+        (task) =>
+          inFlightRef.current.has(tokenAutoHold(account.userId, task.taskDefId)) ||
+          inFlightRef.current.has(tokenRunHold(account.userId, task.taskDefId)),
+      )
+    ) {
+      next = {
+        ...next,
+        tokenTasks: next.tokenTasks.map((task) => {
+          const old = prev.tokenTasks.find((item) => item.taskDefId === task.taskDefId)
+          if (!old) return task
+          let merged = task
+          if (inFlightRef.current.has(tokenAutoHold(account.userId, task.taskDefId))) {
+            merged = { ...merged, auto: old.auto }
+          }
+          if (inFlightRef.current.has(tokenRunHold(account.userId, task.taskDefId))) {
+            merged = { ...merged, status: old.status, canReceive: old.canReceive, busy: old.busy }
           }
           return merged
         }),
@@ -1124,12 +1152,14 @@ export default function KeepAliveApp() {
 
   async function onCheckinTokenTask(userId: number, taskDefId: number) {
     const key = tokenTaskKey(userId, taskDefId)
-    if (busyTokenTaskRef.current.has(key)) return
+    if (busyTokenTaskRef.current.has(key) || busyTokenAutoRef.current.has(key)) return
     const account = accountsRef.current.find((item) => item.userId === userId)
     if (!account?.tokenTasks.some((task) => task.taskDefId === taskDefId)) return
 
     busyTokenTaskRef.current.add(key)
     setBusyTokenTask((prev) => ({ ...prev, [key]: true }))
+    const hold = tokenRunHold(userId, taskDefId)
+    inFlightRef.current.add(hold)
     let accepted = false
     try {
       const epoch = bootIdRef.current
@@ -1142,8 +1172,55 @@ export default function KeepAliveApp() {
       handleError(error)
     } finally {
       if (accepted) scheduleTokenFollowUp(userId)
+      inFlightRef.current.delete(hold)
       busyTokenTaskRef.current.delete(key)
       setBusyTokenTask((prev) => withoutKey(prev, key))
+    }
+  }
+
+  async function onToggleTokenTaskAuto(userId: number, taskDefId: number, on: boolean) {
+    const key = tokenTaskKey(userId, taskDefId)
+    if (busyTokenTaskRef.current.has(key) || busyTokenAutoRef.current.has(key)) return
+    const account = accountsRef.current.find((item) => item.userId === userId)
+    const task = account?.tokenTasks.find((item) => item.taskDefId === taskDefId)
+    if (!task) return
+    const previous = task.auto
+    const hold = tokenAutoHold(userId, taskDefId)
+
+    busyTokenAutoRef.current.add(key)
+    setBusyTokenAuto((prev) => ({ ...prev, [key]: true }))
+    inFlightRef.current.add(hold)
+    patchAccount(userId, (item) => ({
+      ...item,
+      tokenTasks: item.tokenTasks.map((tokenTask) =>
+        tokenTask.taskDefId === taskDefId ? { ...tokenTask, auto: on } : tokenTask,
+      ),
+    }))
+    try {
+      const epoch = bootIdRef.current
+      const result = await api.setTokenTaskAuto(userId, taskDefId, on)
+      noteRevision(result.revision, epoch)
+      patchAccount(userId, (item) => ({
+        ...item,
+        tokenTasks: item.tokenTasks.map((tokenTask) =>
+          tokenTask.taskDefId === taskDefId ? { ...tokenTask, auto: result.auto } : tokenTask,
+        ),
+      }))
+      fetchAfterWrite(result.revision, epoch)
+    } catch (error) {
+      if (!isTimeout(error)) {
+        patchAccount(userId, (item) => ({
+          ...item,
+          tokenTasks: item.tokenTasks.map((tokenTask) =>
+            tokenTask.taskDefId === taskDefId ? { ...tokenTask, auto: previous } : tokenTask,
+          ),
+        }))
+      }
+      handleError(error)
+    } finally {
+      inFlightRef.current.delete(hold)
+      busyTokenAutoRef.current.delete(key)
+      setBusyTokenAuto((prev) => withoutKey(prev, key))
     }
   }
 
@@ -1300,8 +1377,12 @@ export default function KeepAliveApp() {
               account={account}
               refreshing={!!refreshingToken[account.userId]}
               busyTask={busyTokenTask}
+              busyAutoTask={busyTokenAuto}
               onCheckin={(taskDefId) => {
                 void onCheckinTokenTask(account.userId, taskDefId)
+              }}
+              onToggleAuto={(taskDefId, auto) => {
+                void onToggleTokenTaskAuto(account.userId, taskDefId, auto)
               }}
               onRefresh={() => {
                 void onRefreshToken(account.userId)

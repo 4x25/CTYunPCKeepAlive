@@ -12,8 +12,8 @@ export function emptyTokenSummary(): TokenSummary {
   return { totalTokens: 0, usedTokens: 0, expTokens: 0, remainTokens: 0, updatedDate: 0 }
 }
 
-/** 上游任务 → 契约任务（busy 由会话层补充） */
-export function toTokenTask(task: EaiTokenTask, busy: boolean): TokenTask {
+/** 上游任务 → 契约任务（auto/busy 由会话层补充） */
+export function toTokenTask(task: EaiTokenTask, flags: { auto: boolean; busy: boolean }): TokenTask {
   return {
     taskDefId: task.taskDefId,
     taskDefName: task.taskDefName,
@@ -26,7 +26,8 @@ export function toTokenTask(task: EaiTokenTask, busy: boolean): TokenTask {
     canReceive: task.canReceive,
     isSatisfiedCondition: task.isSatisfiedCondition,
     receiveProgressMap: { ...task.receiveProgressMap },
-    busy,
+    auto: flags.auto,
+    busy: flags.busy,
   }
 }
 

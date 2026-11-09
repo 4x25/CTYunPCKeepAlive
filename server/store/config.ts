@@ -82,6 +82,8 @@ const PersistedAccountSchema = z.object({
   pointsWindow: PointsWindowSchema,
   desktops: z.array(DesktopSwitchSchema).default([]),
   tasks: z.array(TaskSwitchSchema).default([]),
+  /** 云智助手 Token 任务自动开关（当前仅 3001 每日签到） */
+  tokenTasks: z.array(TaskSwitchSchema).default([]),
 })
 
 const PersistedConfigSchema = z.object({

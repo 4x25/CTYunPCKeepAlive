@@ -21,7 +21,10 @@ interface Props {
   refreshing: boolean
   /** 签到 / 领取在途，键为 `userId:taskDefId` */
   busyTask: Readonly<Record<string, boolean>>
+  /** 自动开关保存在途，键为 `userId:taskDefId` */
+  busyAutoTask: Readonly<Record<string, boolean>>
   onCheckin: (taskDefId: number) => void
+  onToggleAuto: (taskDefId: number, auto: boolean) => void
   onRefresh: () => void
 }
 
@@ -40,7 +43,7 @@ export default function TokenPanel(props: Props) {
           <span class="text-xs text-base-content/60">签到奖励预计 1 分钟内到账</span>
           <HelpMark
             label="Token 签到说明"
-            tip="Token 任务由云智助手发放奖励：每日签到 +20万 Token，连续 7 天签到 +100万 Token。工具只代为点击「签到 / 领取」，不会替你订购 Token 套餐；连续 7 天任务需云端记录满足 7 天后按钮才会变为「领取」。"
+            tip="Token 任务由云智助手发放奖励：每日签到 +20万 Token，连续 7 天签到 +100万 Token。工具只代为点击「签到」，不会替你订购 Token 套餐；连续 7 天任务当前仅展示进度，不提供操作与自动签到。打开「自动」后，每天 00:10 后检查并补签一次。"
           />
         </div>
         <div class="flex items-center gap-2.5">
@@ -100,25 +103,31 @@ export default function TokenPanel(props: Props) {
                 <td>奖励</td>
                 <td>进度</td>
                 <td>状态</td>
-                <th class="w-20">执行</th>
+                <td class="w-20">执行</td>
+                <th class="w-14">自动</th>
               </tr>
             </thead>
             <tbody>
               {tasks.map((task) => {
                 const key = `${account.userId}:${task.taskDefId}`
                 const busy = task.busy || !!props.busyTask[key]
+                const busyAuto = !!props.busyAutoTask[key]
+                const anyBusy = busy || busyAuto
+                const canAutomate = task.taskDefId === TOKEN_DAILY_TASK_ID
                 const action = tokenTaskAction(task)
                 const badge = tokenTaskStatusBadge(task)
                 const progress = tokenTaskProgress(task)
-                const label =
-                  busy && !task.busy
-                    ? task.taskDefId === TOKEN_DAILY_TASK_ID
-                      ? '签到中…'
-                      : '领取中…'
-                    : action.label
+                const label = busy && !task.busy ? '签到中…' : action.label
                 const tip = eaichatUnavailable
                   ? (account.eaichat.msg ?? '云智助手会话不可用，Token 任务暂不可用')
                   : action.tip
+                const autoTip = busyAuto
+                  ? '自动开关正在保存…'
+                  : busy
+                    ? '该任务有操作正在进行…'
+                    : eaichatUnavailable
+                      ? (account.eaichat.msg ?? '云智助手会话不可用，Token 任务暂不可用')
+                      : '每天 00:10 后自动检查并补签；已签到则不再重复请求'
                 return (
                   <tr key={task.taskDefId} class="row-hover">
                     <td class="text-[13px] font-semibold">{task.taskDefName || '任务'}</td>
@@ -138,16 +147,30 @@ export default function TokenPanel(props: Props) {
                     <td>
                       <span class={`badge badge-soft badge-sm font-mono ${badge.cls}`}>{badge.label}</span>
                     </td>
-                    <th class="w-20 font-normal">
-                      <button
-                        type="button"
-                        class="btn btn-xs"
-                        disabled={action.disabled || busy || eaichatUnavailable}
-                        title={tip}
-                        onClick={() => props.onCheckin(task.taskDefId)}
-                      >
-                        {label}
-                      </button>
+                    <td class="w-20">
+                      {canAutomate && (
+                        <button
+                          type="button"
+                          class="btn btn-xs"
+                          disabled={action.disabled || anyBusy || eaichatUnavailable}
+                          title={tip}
+                          onClick={() => props.onCheckin(task.taskDefId)}
+                        >
+                          {label}
+                        </button>
+                      )}
+                    </td>
+                    <th class="w-14 font-normal" title={canAutomate ? autoTip : undefined}>
+                      {canAutomate && (
+                        <input
+                          type="checkbox"
+                          class="toggle toggle-sm"
+                          checked={task.auto}
+                          disabled={anyBusy || eaichatUnavailable}
+                          aria-label={`自动签到 ${task.taskDefName}`}
+                          onChange={(e: Event) => props.onToggleAuto(task.taskDefId, (e.target as HTMLInputElement).checked)}
+                        />
+                      )}
                     </th>
                   </tr>
                 )

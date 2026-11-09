@@ -119,6 +119,8 @@ export class AccountSession {
   private tokenRefresh: Promise<TokenSnapshot> | null = null
   /** 签到 / 领取在途（taskDefId 互斥） */
   private tokenRunning = new Set<number>()
+  /** Token 任务自动开关（持久化；仅每日签到支持） */
+  private tokenAuto = new Map<number, boolean>()
   private ctyun: CtyunClient | null = null
   private eai: EaiChatClient | null = null
   private profile: CtyunLoginProfile | null = null
@@ -141,6 +143,9 @@ export class AccountSession {
     }
     for (const item of persisted.tasks) {
       if (item.auto) this.taskAuto.set(item.taskDefId, true)
+    }
+    for (const item of persisted.tokenTasks ?? []) {
+      if (item.auto) this.tokenAuto.set(item.taskDefId, true)
     }
   }
 
@@ -589,7 +594,12 @@ export class AccountSession {
     /* 期间发生过重登/会话失效：丢弃旧会话的响应，避免污染新会话的 Token 缓存 */
     if (this.eai !== client) return this.tokenSnapshot()
     this.token = tokenUsageSummary(usage)
-    this.tokenTasks = tasks.map((task) => toTokenTask(task, this.tokenRunning.has(task.taskDefId)))
+    this.tokenTasks = tasks.map((task) =>
+      toTokenTask(task, {
+        auto: this.tokenAuto.get(task.taskDefId) ?? false,
+        busy: this.tokenRunning.has(task.taskDefId),
+      }),
+    )
     this.touch()
     return this.tokenSnapshot()
   }
@@ -617,8 +627,20 @@ export class AccountSession {
   private syncTokenFlags(): void {
     this.tokenTasks = this.tokenTasks.map((task) => ({
       ...task,
+      auto: this.tokenAuto.get(task.taskDefId) ?? false,
       busy: this.tokenRunning.has(task.taskDefId),
     }))
+  }
+
+  /** Token 任务自动开关（仅每日签到，manager 负责拒绝其它 taskDefId） */
+  isTokenTaskAuto(taskDefId: number): boolean {
+    return this.tokenAuto.get(taskDefId) ?? false
+  }
+
+  setTokenTaskAuto(taskDefId: number, auto: boolean): void {
+    this.tokenAuto.set(taskDefId, auto)
+    this.syncTokenFlags()
+    this.touch()
   }
 
   beginTokenTaskRun(taskDefId: number): boolean {
@@ -732,6 +754,8 @@ export class AccountSession {
   inheritSettingsFrom(previous: AccountSession): void {
     this.interval = previous.interval
     this.pointsWindow = { ...previous.pointsWindow }
+    /* Token 任务 ID 固定（3001/3002），直接按 taskDefId 继承自动开关 */
+    this.tokenAuto = new Map(previous.tokenAuto)
 
     if (this.desktops.length) {
       this.desktopAuto.clear()
@@ -885,6 +909,10 @@ export class AccountSession {
     for (const [taskDefId, auto] of this.taskAuto) {
       if (auto) tasks.push({ taskDefId, auto: true })
     }
+    const tokenTasks: PersistedAccount['tokenTasks'] = []
+    for (const [taskDefId, auto] of this.tokenAuto) {
+      if (auto) tokenTasks.push({ taskDefId, auto: true })
+    }
     return {
       userId: this.userId,
       userAccount: this.userAccount,
@@ -894,6 +922,7 @@ export class AccountSession {
       pointsWindow: { ...this.pointsWindow },
       desktops,
       tasks,
+      tokenTasks,
     }
   }
 
